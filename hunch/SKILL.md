@@ -174,9 +174,15 @@ first's, not merge with it.
    - `confused`: OTHER has crossed 0.35. Say the current hypothesis set
      doesn't explain the evidence and propose new hypotheses (step 7).
 
-7. **If `regenerationSuggested: true`**, propose a fresh set of hypotheses
-   via `hypotheses` (step 2) — this demotes the old set, it never deletes
-   them, and calibration/history stay intact across the regeneration.
+7. **If `regenerationSuggested: true`**, run `python3 hunch.py residual SIT`
+   first, before re-brainstorming from scratch. It ranks your observed
+   clusters by explanatory gap — how badly the current (named) hypotheses
+   fit each one — worst first. Aim new hypotheses at the top of that list:
+   "what missing cause would most likely produce the outcomes we're
+   failing to explain?" is a sharper prompt than a blank slate. Then set
+   the fresh hypotheses via `hypotheses` (step 2) — this demotes the old
+   set, it never deletes them, and calibration/history stay intact across
+   the regeneration.
 
 8. **Resolve** when the question is actually answered:
    `python3 hunch.py resolve SIT --resolution h-2` (or
@@ -202,6 +208,7 @@ first's, not merge with it.
 | `get SIT` | Full detail view: hypotheses, observations, clusters, history, surface text |
 | `list [--status open\|stale\|resolved]` | Summary rows across situations |
 | `surface SIT` | Current surface text only |
+| `residual SIT` | Rank observed clusters by explanatory gap (worst-explained first) — where a missing hypothesis likely hides |
 | `resolve SIT --resolution X` | Resolve + record calibration (`X` = hypothesis id, or `"other: ..."`) |
 | `remove SIT` | Permanently delete a situation (test/obsolete — no calibration written) |
 | `calibration` | Aggregate accuracy stats across all resolved situations |

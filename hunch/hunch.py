@@ -1099,6 +1099,50 @@ def build_surface_text(store, sid):
     return '\n'.join(lines)
 
 
+def compute_residuals(store, sid):
+    """Per-cluster explanatory gap: 1 - bestFit, where bestFit is the highest
+    effective likelihood any ACTIVE NAMED hypothesis (excluding OTHER) assigns
+    to that cluster under the last scoring. Ranks the observed outcomes the
+    current hypothesis set explains WORST -- i.e. where a missing cause most
+    likely hides. Reliability is folded in via _effective_likelihood (matching
+    the posterior math), so an unreliable cluster's residual is damped toward
+    the neutral 0.5. Read-only; requires a prior rescore (lastScoring).
+    """
+    situation = _require_situation(store, sid)
+    clusters = get_clusters(store, sid)
+    last = situation['lastScoring']
+    active_named = [h for h in situation['hypotheses']
+                    if h['status'] == 'active' and h['id'] != TUNING['OTHER_ID']]
+    if not last or not clusters or not active_named:
+        return {'situationId': sid, 'scored': bool(last and clusters and active_named), 'clusters': []}
+    active_ids = {h['id'] for h in active_named}
+    cluster_by_id = {c['id']: c for c in clusters}
+    rows_by_cluster = _index_matrix(last['matrix'], cluster_by_id, active_ids)['rowsByCluster']
+    stmt_by_id = {h['id']: h['statement'] for h in active_named}
+    rows = []
+    for c in clusters:
+        row = rows_by_cluster.get(c['id'])
+        best_fit = None
+        best_hid = None
+        for h in active_named:
+            score = row.get(h['id']) if row is not None and h['id'] in row else None
+            eff = _effective_likelihood(score, c['reliability'])
+            if best_fit is None or eff > best_fit:
+                best_fit = eff
+                best_hid = h['id']
+        rows.append({
+            'clusterId': c['id'],
+            'residual': 1 - best_fit,
+            'bestFit': best_fit,
+            'reliability': c['reliability'],
+            'bestHypothesisId': best_hid,
+            'bestHypothesisStatement': stmt_by_id.get(best_hid),
+            'representativeText': _truncate(c['representativeText'], TUNING['SURFACE_SNIPPET_CHARS']),
+        })
+    rows.sort(key=lambda r: r['residual'], reverse=True)
+    return {'situationId': sid, 'scored': True, 'clusters': rows}
+
+
 def _round2(n):
     return None if n is None else round(n * 100) / 100
 
@@ -1283,6 +1327,9 @@ def _build_parser():
     p_surface = sub.add_parser('surface', help='Get a situation\'s current surface text.')
     p_surface.add_argument('situation_id')
 
+    p_residual = sub.add_parser('residual', help='Rank observed clusters by explanatory gap (worst-explained first).')
+    p_residual.add_argument('situation_id')
+
     p_resolve = sub.add_parser('resolve', help='Resolve a situation, recording calibration.')
     p_resolve.add_argument('situation_id')
     p_resolve.add_argument('--resolution', required=True)
@@ -1315,7 +1362,7 @@ def _dispatch(args):
 
     path, now = _resolve_path_and_now(args)
 
-    read_only_commands = {'clusters', 'get', 'list', 'surface', 'calibration'}
+    read_only_commands = {'clusters', 'get', 'list', 'surface', 'calibration', 'residual'}
     is_read_only = args.command in read_only_commands
 
     try:
@@ -1383,6 +1430,10 @@ def _run_command(args, store, now):
     if cmd == 'surface':
         _require_situation(store, args.situation_id)
         return {'surfaceText': build_surface_text(store, args.situation_id)}
+
+    if cmd == 'residual':
+        _require_situation(store, args.situation_id)
+        return compute_residuals(store, args.situation_id)
 
     if cmd == 'resolve':
         return resolve(store, args.situation_id, resolution=args.resolution, now=now)

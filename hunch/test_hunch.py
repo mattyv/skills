@@ -967,6 +967,111 @@ class TestRescore(unittest.TestCase):
 
 
 # =============================================================================
+# WP7 — compute_residuals (explanatory-gap lens)
+# =============================================================================
+
+class TestComputeResiduals(unittest.TestCase):
+    def test_ordering_and_residual_equals_one_minus_best_fit(self):
+        store = hunch.new_store(now=1)
+        sit = open_situation(store)
+        hunch.apply_hypotheses(store, sit['id'], VALID_HYPS, now=5)
+        s = hunch.get_situation(store, sit['id'])
+        active = [h for h in s['hypotheses'] if h['status'] == 'active']
+        hunch.add_observation(store, sit['id'], text='badly explained event', reliability=1.0, now=10)
+        hunch.add_observation(store, sit['id'], text='well explained event', reliability=1.0,
+                               force_new_cluster=True, now=11)
+        clusters = hunch.get_clusters(store, sit['id'])
+        bad_cluster, good_cluster = clusters[0], clusters[1]
+
+        def likelihood_fn(h, c):
+            if c['id'] == bad_cluster['id']:
+                return 0.05
+            return 0.95
+
+        matrix = _full_matrix(active, clusters, likelihood_fn)
+        hunch.rescore(store, sit['id'], matrix, now=12)
+
+        result = hunch.compute_residuals(store, sit['id'])
+        self.assertTrue(result['scored'])
+        rows = result['clusters']
+        self.assertEqual(len(rows), 2)
+        # Worst-explained cluster ranks first.
+        self.assertEqual(rows[0]['clusterId'], bad_cluster['id'])
+        self.assertEqual(rows[-1]['clusterId'], good_cluster['id'])
+        for row in rows:
+            self.assertAlmostEqual(row['residual'], 1 - row['bestFit'])
+        self.assertGreater(rows[0]['residual'], rows[-1]['residual'])
+
+    def test_other_excluded_from_best_fit(self):
+        store = hunch.new_store(now=1)
+        sit = open_situation(store)
+        hunch.apply_hypotheses(store, sit['id'], VALID_HYPS, now=5)
+        s = hunch.get_situation(store, sit['id'])
+        active = [h for h in s['hypotheses'] if h['status'] == 'active']
+        hunch.add_observation(store, sit['id'], text='only OTHER explains this', reliability=1.0, now=10)
+        clusters = hunch.get_clusters(store, sit['id'])
+
+        def likelihood_fn(h, c):
+            return 0.99 if h['id'] == 'other' else 0.05
+
+        matrix = _full_matrix(active, clusters, likelihood_fn)
+        hunch.rescore(store, sit['id'], matrix, now=11)
+
+        result = hunch.compute_residuals(store, sit['id'])
+        self.assertTrue(result['scored'])
+        row = result['clusters'][0]
+        # Even though OTHER scored 0.99, it's excluded from bestFit -- only
+        # named hypotheses (all at 0.05) count, so the gap stays high.
+        self.assertAlmostEqual(row['bestFit'], 0.05)
+        self.assertAlmostEqual(row['residual'], 0.95)
+
+    def test_reliability_damps_residual_toward_neutral(self):
+        store = hunch.new_store(now=1)
+        sit = open_situation(store)
+        hunch.apply_hypotheses(store, sit['id'], VALID_HYPS, now=5)
+        s = hunch.get_situation(store, sit['id'])
+        active = [h for h in s['hypotheses'] if h['status'] == 'active']
+        hunch.add_observation(store, sit['id'], text='firsthand account', source_type='firsthand',
+                               reliability=1.0, now=10)
+        hunch.add_observation(store, sit['id'], text='secondhand rumor', source_type='rumor',
+                               reliability=0.3, force_new_cluster=True, now=11)
+        clusters = hunch.get_clusters(store, sit['id'])
+        matrix = _full_matrix(active, clusters, lambda h, c: 0.0)
+        hunch.rescore(store, sit['id'], matrix, now=12)
+
+        result = hunch.compute_residuals(store, sit['id'])
+        by_cluster = {row['clusterId']: row for row in result['clusters']}
+        firsthand_row = by_cluster[clusters[0]['id']]
+        rumor_row = by_cluster[clusters[1]['id']]
+        self.assertGreater(firsthand_row['residual'], rumor_row['residual'])
+
+    def test_no_scoring_returns_unscored_empty(self):
+        store = hunch.new_store(now=1)
+        sit = open_situation(store)
+        hunch.apply_hypotheses(store, sit['id'], VALID_HYPS, now=5)
+        hunch.add_observation(store, sit['id'], text='an observation', now=10)
+        result = hunch.compute_residuals(store, sit['id'])
+        self.assertEqual(result, {'situationId': sit['id'], 'scored': False, 'clusters': []})
+
+    def test_missing_matrix_cell_neutral_fills_to_half(self):
+        store = hunch.new_store(now=1)
+        sit = open_situation(store)
+        hunch.apply_hypotheses(store, sit['id'], VALID_HYPS, now=5)
+        s = hunch.get_situation(store, sit['id'])
+        active = [h for h in s['hypotheses'] if h['status'] == 'active']
+        hunch.add_observation(store, sit['id'], text='never scored', reliability=1.0, now=10)
+        clusters = hunch.get_clusters(store, sit['id'])
+        # rescore with an empty matrix: no rows at all for this cluster.
+        hunch.rescore(store, sit['id'], [], now=11)
+
+        result = hunch.compute_residuals(store, sit['id'])
+        self.assertTrue(result['scored'])
+        row = result['clusters'][0]
+        self.assertAlmostEqual(row['bestFit'], 0.5)
+        self.assertAlmostEqual(row['residual'], 0.5)
+
+
+# =============================================================================
 # WP4 — resolve/calibration/remove/purge
 # =============================================================================
 
@@ -1249,6 +1354,32 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(code, 0, err)
         data = json.loads(out)
         self.assertIn('surfaceText', data)
+
+    def test_residual_is_read_only(self):
+        code, out, _ = self._run(['open', '--question', 'Why?'])
+        sid = json.loads(out)['id']
+        self._run(['hypotheses', sid, '--json', json.dumps(VALID_HYPS)])
+        self._run(['observe', sid, '--text', 'an observation'])
+        code, out, _ = self._run(['get', sid])
+        active_ids = [h['id'] for h in json.loads(out)['hypotheses'] if h['status'] == 'active']
+        code, out, _ = self._run(['clusters', sid])
+        clusters = json.loads(out)
+        matrix = [{'clusterId': clusters[0]['id'], 'likelihoods': [
+            {'hypothesisId': hid, 'likelihood': 0.5} for hid in active_ids
+        ]}]
+        code, out, err = self._run(['rescore', sid, '--json', json.dumps(matrix)])
+        self.assertEqual(code, 0, err)
+
+        with open(self.ledger, 'rb') as f:
+            before = f.read()
+        code, out, err = self._run(['residual', sid])
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertIn('clusters', data)
+        self.assertIsInstance(data['clusters'], list)
+        with open(self.ledger, 'rb') as f:
+            after = f.read()
+        self.assertEqual(before, after)
 
     def test_resolve_and_calibration_and_remove(self):
         code, out, _ = self._run(['open', '--question', 'Why?'])
