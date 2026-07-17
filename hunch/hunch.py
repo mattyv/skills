@@ -69,7 +69,7 @@ SCHEMA_VERSION = 1
 # =============================================================================
 # Layer 2: Dedupe — tokenSet/jaccard fuzzy matching, ported from
 # a fuzzy-dedupe helper. Only token-set/jaccard similarity (no ticket matching, no
-# isDuplicate/record — those are Q-Light-specific and out of scope here).
+# duplicate-history tracking — out of scope here).
 # =============================================================================
 
 # 32-word English stopword list for token-set similarity.
