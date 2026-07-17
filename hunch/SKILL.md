@@ -39,6 +39,11 @@ came from a specific matrix at a specific time. Editing it by hand breaks
 that trail and makes `calibration` and `posteriorHistory` lie. If a situation
 is wrong, use `remove` and start over, or `resolve` it and open a new one.
 
+Only run one `hunch.py` invocation against a given ledger at a time. Writes
+are atomic (no corruption from a mid-write crash), but concurrent
+invocations are last-writer-wins — the second write can silently clobber the
+first's, not merge with it.
+
 ## The protocol
 
 1. **Open** a situation for the question: `python3 hunch.py open --question "..."`.
@@ -47,10 +52,12 @@ is wrong, use `remove` and start over, or `resolve` it and open a new one.
 2. **Invent 3-6 hypotheses yourself** and set them:
    `python3 hunch.py hypotheses SIT --json '[...]'`
 
-   Every hypothesis object needs all three fields. `predictedEvidence` is
-   REQUIRED — a non-empty array of 2-3 short strings naming what you'd expect
-   to observe if that hypothesis were true. This is the exact shape the CLI
-   validates, character for character:
+   Every hypothesis object needs all three fields, and you need 3-6 of them
+   (`MIN_HYPOTHESES`-`MAX_HYPOTHESES`) — `hypotheses` seeds a reserved
+   `"other"` hypothesis itself, so don't include one yourself.
+   `predictedEvidence` is REQUIRED — a non-empty array of short strings
+   naming what you'd expect to observe if that hypothesis were true. This is
+   the exact shape the CLI validates, character for character:
 
    ```json
    [
@@ -58,6 +65,16 @@ is wrong, use `remove` and start over, or `resolve` it and open a new one.
        "statement": "The deploy pipeline is flaky because of a race condition in the cache warm step",
        "prior": 0.4,
        "predictedEvidence": ["failures cluster right after a cache-clearing deploy", "retrying the same deploy succeeds"]
+     },
+     {
+       "statement": "The pipeline runner is resource-starved under concurrent load",
+       "prior": 0.3,
+       "predictedEvidence": ["failures cluster with high concurrent deploy count", "CPU/memory metrics spike during failures"]
+     },
+     {
+       "statement": "A flaky third-party dependency the pipeline calls out to is unreliable",
+       "prior": 0.3,
+       "predictedEvidence": ["failures correlate with that dependency's own incident reports"]
      }
    ]
    ```
@@ -96,7 +113,8 @@ is wrong, use `remove` and start over, or `resolve` it and open a new one.
        "clusterId": "c-1",
        "likelihoods": [
          { "hypothesisId": "h-1", "likelihood": 0.85, "rationale": "matches the cache-step failure pattern exactly" },
-         { "hypothesisId": "h-2", "likelihood": 0.2, "rationale": "no evidence of the alternate cause" },
+         { "hypothesisId": "h-2", "likelihood": 0.2, "rationale": "no evidence of resource starvation" },
+         { "hypothesisId": "h-3", "likelihood": 0.15, "rationale": "no mention of the third-party dependency" },
          { "hypothesisId": "other", "likelihood": 0.15, "rationale": "doesn't rule out an unknown cause" }
        ]
      }
@@ -106,11 +124,20 @@ is wrong, use `remove` and start over, or `resolve` it and open a new one.
    The value key is `likelihood` — `score`/`p`/`weight` are silently ignored.
    Then rescore: `python3 hunch.py rescore SIT --json '[...]'`.
 
+   **`rescore` is a FULL re-score, every time.** The matrix must cover
+   ALL clusters currently returned by `clusters SIT`, not just the ones
+   that are new since your last rescore — scoring only the new clusters
+   neutral-fills (0.5) every cluster you left out, silently diluting
+   hypotheses that already had strong evidence. `matrixStats`/`warnings`
+   in the result will tell you if cells came up short; treat that as a bug
+   in your matrix, not background noise.
+
 5. **Check `warnings` in the rescore result before doing anything else.**
    A non-empty `warnings` array means part or all of your matrix didn't
-   land — wrong cluster ids, wrong hypothesis ids, duplicate rows, or
-   out-of-range values that got silently clamped. Fix your matrix and
-   rescore again; don't relay a result you know is built on a warning.
+   land — wrong cluster ids, wrong hypothesis ids, duplicate rows, malformed
+   rows/cells, or out-of-range values that got silently clamped. Fix your
+   matrix and rescore again; don't relay a result you know is built on a
+   warning.
 
 6. **Verdict gating — only conclude on `peaked`, `flip`, or `confused`.**
    Always relay the FULL posterior distribution and discriminators via

@@ -10,6 +10,8 @@ the implementation brief. Run with:
 import json
 import math
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -411,6 +413,9 @@ def _setup_matrix_situation(store, hyps=None):
 
 class TestPosteriorMath(unittest.TestCase):
     def test_hand_computed_uniform_blend_values(self):
+        # VALID_HYPS priors 0.4/0.3/0.3 (sum 1.0) scale to
+        # target_sum=1-OTHER_INITIAL_PRIOR=0.85 -> h0=0.34, h1=0.255,
+        # h2=0.255, other=0.15 (apply_hypotheses's renormalization, exact).
         store = hunch.new_store(now=1)
         sit = open_situation(store)
         hunch.apply_hypotheses(store, sit['id'], VALID_HYPS, now=5)
@@ -427,15 +432,69 @@ class TestPosteriorMath(unittest.TestCase):
         ]}]
         active_hyps = [h for h in s['hypotheses'] if h['status'] == 'active']
         result = hunch.compute_posteriors(hypotheses=active_hyps, clusters=clusters, matrix=matrix)
-        # priors: h0..h2 each 0.85/3=0.28333, other=0.15
-        # raw = prior * eff(likelihood, reliability=1.0) = prior * likelihood (reliability 1 -> eff=score)
-        priors = {h['id']: h['prior'] for h in active_hyps}
-        raw = {hid: priors[hid] * lk for hid, lk in zip(h_ids + ['other'], [0.9, 0.1, 0.1, 0.1])}
-        raw_sum = sum(raw.values())
-        expected = {hid: v / raw_sum for hid, v in raw.items()}
-        # other floor may kick in; check no-floor case value is close before floor
-        for hid in h_ids:
-            self.assertAlmostEqual(result['posteriors'][hid], expected[hid], places=6) if expected['other'] >= 0.05 else None
+
+        # reliability=1.0 -> effective likelihood == raw score, so
+        # raw_i = prior_i * likelihood_i:
+        #   h0: 0.34  * 0.9 = 0.306
+        #   h1: 0.255 * 0.1 = 0.0255
+        #   h2: 0.255 * 0.1 = 0.0255
+        #   other: 0.15 * 0.1 = 0.015
+        # raw_sum = 0.372, giving pre-floor posteriors
+        #   h0=0.8225806451612904 h1=h2=0.06854838709677419 other=0.04032258064516128
+        # other < OTHER_FLOOR (0.05) -> the floor rescale kicks in:
+        #   scale = (1-0.05) / (1-0.04032258064516128) = 0.9899193548387097
+        #   h0 -> 0.306/0.372 * scale, etc., other pinned to 0.05
+        # (verified independently with python3 before writing these literals in)
+        expected = {
+            h_ids[0]: 0.8142857142857143,
+            h_ids[1]: 0.06785714285714285,
+            h_ids[2]: 0.06785714285714285,
+            'other': 0.05,
+        }
+        for hid, value in expected.items():
+            self.assertAlmostEqual(result['posteriors'][hid], value, places=9)
+        self.assertAlmostEqual(sum(result['posteriors'].values()), 1.0, places=9)
+
+    def test_hand_computed_reliability_blend_no_floor(self):
+        # Same VALID_HYPS priors (h0=0.34, h1=0.255, h2=0.255, other=0.15),
+        # but reliability=0.6 this time so the blend
+        # eff = r*s + (1-r)*NEUTRAL_LIKELIHOOD actually gets exercised
+        # (reliability=1.0 above degenerates to eff==score).
+        store = hunch.new_store(now=1)
+        sit = open_situation(store)
+        hunch.apply_hypotheses(store, sit['id'], VALID_HYPS, now=5)
+        s = hunch.get_situation(store, sit['id'])
+        h_ids = [h['id'] for h in s['hypotheses'] if h['id'] != 'other']
+        hunch.add_observation(store, sit['id'], text='a partially-reliable observation', reliability=0.6, now=10)
+        clusters = hunch.get_clusters(store, sit['id'])
+        cid = clusters[0]['id']
+        matrix = [{'clusterId': cid, 'likelihoods': [
+            {'hypothesisId': h_ids[0], 'likelihood': 0.8},
+            {'hypothesisId': h_ids[1], 'likelihood': 0.2},
+            {'hypothesisId': h_ids[2], 'likelihood': 0.2},
+            {'hypothesisId': 'other', 'likelihood': 0.2},
+        ]}]
+        active_hyps = [h for h in s['hypotheses'] if h['status'] == 'active']
+        result = hunch.compute_posteriors(hypotheses=active_hyps, clusters=clusters, matrix=matrix)
+
+        # eff = 0.6*s + 0.4*0.5:
+        #   h0: eff(0.8) = 0.68 -> raw = 0.34  * 0.68 = 0.2312
+        #   h1: eff(0.2) = 0.32 -> raw = 0.255 * 0.32 = 0.0816
+        #   h2: eff(0.2) = 0.32 -> raw = 0.255 * 0.32 = 0.0816
+        #   other: eff(0.2) = 0.32 -> raw = 0.15 * 0.32 = 0.048
+        # raw_sum = 0.4424, other posterior = 0.048/0.4424 = 0.10849909584086799
+        # (> OTHER_FLOOR 0.05, so the floor never kicks in — this case is
+        # deliberately clean of that branch)
+        # (verified independently with python3 before writing these literals in)
+        expected = {
+            h_ids[0]: 0.5226039783001808,
+            h_ids[1]: 0.1844484629294756,
+            h_ids[2]: 0.1844484629294756,
+            'other': 0.10849909584086799,
+        }
+        for hid, value in expected.items():
+            self.assertAlmostEqual(result['posteriors'][hid], value, places=9)
+        self.assertAlmostEqual(sum(result['posteriors'].values()), 1.0, places=9)
 
     def test_shuffle_order_invariance(self):
         store = hunch.new_store(now=1)
@@ -491,7 +550,17 @@ class TestPosteriorMath(unittest.TestCase):
             {'hypothesisId': h['id'], 'likelihood': 0.0} for h in active_hyps
         ]}]
         result = hunch.compute_posteriors(hypotheses=active_hyps, clusters=clusters, matrix=matrix)
-        # rawSum ~ 0 -> falls back to renormalized priors (still floors OTHER)
+        # rawSum ~ 0 -> falls back to renormalized priors. apply_hypotheses
+        # always scales priors to sum to exactly 1.0 (target_sum 0.85 for the
+        # real hypotheses + OTHER_INITIAL_PRIOR 0.15), so prior_sum == 1.0
+        # here and the "renormalized" priors equal the priors themselves —
+        # and OTHER's prior (0.15) is already above OTHER_FLOOR (0.05), so
+        # the floor branch does not fire and posteriors == priors exactly.
+        priors = {h['id']: h['prior'] for h in active_hyps}
+        prior_sum = sum(priors.values())
+        self.assertAlmostEqual(prior_sum, 1.0, places=9)
+        for hid, prior in priors.items():
+            self.assertAlmostEqual(result['posteriors'][hid], prior / prior_sum, places=9)
         self.assertAlmostEqual(sum(result['posteriors'].values()), 1.0, places=9)
 
     def test_zero_sum_fallback_uniform_when_priors_also_zero(self):
@@ -523,10 +592,16 @@ class TestPosteriorMath(unittest.TestCase):
         self.assertTrue(any('duplicate matrix rows' in w for w in warnings))
         # matched cells reflects only last row (1 cell), not both rows (2 cells)
         self.assertEqual(stats['matchedCells'], 1)
-        # math follows the last row (0.9), not the first (0.1)
-        result = hunch.compute_posteriors(hypotheses=active_hyps,
-                                           clusters=[c for c in clusters if c['id'] == cid], matrix=matrix)
-        # can't directly assert internal raw score, but matchedCells confirms last-wins
+        # math follows the last row (0.9), not the first (0.1): the posteriors
+        # computed from the duplicate-row matrix must equal the posteriors
+        # computed from a matrix containing ONLY the winning last row.
+        cluster_subset = [c for c in clusters if c['id'] == cid]
+        result_dup = hunch.compute_posteriors(hypotheses=active_hyps, clusters=cluster_subset, matrix=matrix)
+        last_row_only_matrix = [{'clusterId': cid, 'likelihoods': [{'hypothesisId': h_ids[0], 'likelihood': 0.9}]}]
+        result_last_only = hunch.compute_posteriors(hypotheses=active_hyps, clusters=cluster_subset,
+                                                      matrix=last_row_only_matrix)
+        for hid in result_dup['posteriors']:
+            self.assertAlmostEqual(result_dup['posteriors'][hid], result_last_only['posteriors'][hid], places=9)
 
     def test_duplicate_cell_within_row_last_wins(self):
         store = hunch.new_store(now=1)
@@ -599,6 +674,28 @@ class TestPosteriorMath(unittest.TestCase):
         self.assertAlmostEqual(uniform, 1.0, places=9)
         peaked = hunch.normalized_entropy({'a': 0.99, 'b': 0.01})
         self.assertLess(peaked, 0.2)
+
+    def test_malformed_row_and_cell_shapes_are_skipped_not_crashed(self):
+        store = hunch.new_store(now=1)
+        sit, o1, o2 = _setup_matrix_situation(store)
+        s = hunch.get_situation(store, sit['id'])
+        active_hyps = [h for h in s['hypotheses'] if h['status'] == 'active']
+        h_ids = [h['id'] for h in active_hyps if h['id'] != 'other']
+        clusters = hunch.get_clusters(store, sit['id'])
+        cid = o1['clusterId']
+        matrix = [
+            1,  # not a dict row at all
+            {'clusterId': cid, 'likelihoods': [
+                'not-a-cell',  # not a dict cell
+                {'hypothesisId': h_ids[0], 'likelihood': 0.7},
+            ]},
+        ]
+        stats = hunch.compute_matrix_stats(matrix, clusters, active_hyps, s['hypotheses'])
+        self.assertGreater(stats.get('malformedCount', 0), 0)
+        warnings = hunch.build_matrix_warnings(stats)
+        self.assertTrue(any('malformed' in w for w in warnings))
+        # the well-formed cell in the well-formed row still lands
+        self.assertEqual(stats['matchedCells'], 1)
 
     def test_matched_cells_never_exceeds_total_cells(self):
         store = hunch.new_store(now=1)
@@ -948,6 +1045,18 @@ class TestCLI(unittest.TestCase):
         clusters = json.loads(out)
         self.assertEqual(len(clusters), 1)
 
+    def test_observe_reliability_nan_rejected(self):
+        code, out, _ = self._run(['open', '--question', 'Why?'])
+        sid = json.loads(out)['id']
+        code, out, err = self._run(['observe', sid, '--text', 'x', '--reliability', 'nan'])
+        self.assertNotEqual(code, 0)
+
+    def test_observe_reliability_inf_rejected(self):
+        code, out, _ = self._run(['open', '--question', 'Why?'])
+        sid = json.loads(out)['id']
+        code, out, err = self._run(['observe', sid, '--text', 'x', '--reliability', 'inf'])
+        self.assertNotEqual(code, 0)
+
     def test_observe_mutually_exclusive_flags_error(self):
         code, out, _ = self._run(['open', '--question', 'Why?'])
         sid = json.loads(out)['id']
@@ -965,6 +1074,49 @@ class TestCLI(unittest.TestCase):
         data = json.loads(out)
         self.assertIn('clusterId', data['error'])
         self.assertIn('likelihoods', data['error'])
+
+    def test_rescore_flat_non_dict_rows_no_crash(self):
+        # HIGH-2 repro #1: `rescore --json '[1,2,3]'` is valid JSON and a
+        # list (passes the top-level isinstance check) but its elements
+        # aren't row dicts — must not raise, must stay JSON-only stdout.
+        code, out, _ = self._run(['open', '--question', 'Why?'])
+        sid = json.loads(out)['id']
+        self._run(['hypotheses', sid, '--json', json.dumps(VALID_HYPS)])
+        self._run(['observe', sid, '--text', 'an observation'])
+        code, out, err = self._run(['rescore', sid, '--json', json.dumps([1, 2, 3])])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, '')
+        data = json.loads(out)
+        self.assertIn('warnings', data)
+        self.assertTrue(any('malformed' in w for w in data['warnings']))
+
+    def test_rescore_row_missing_cluster_id_no_crash(self):
+        # HIGH-2 repro #2: a row dict with no "clusterId" key at all.
+        code, out, _ = self._run(['open', '--question', 'Why?'])
+        sid = json.loads(out)['id']
+        self._run(['hypotheses', sid, '--json', json.dumps(VALID_HYPS)])
+        self._run(['observe', sid, '--text', 'an observation'])
+        matrix = [{'likelihoods': [{'hypothesisId': 'h-1', 'likelihood': 0.5}]}]
+        code, out, err = self._run(['rescore', sid, '--json', json.dumps(matrix)])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, '')
+        data = json.loads(out)
+        self.assertIn('warnings', data)
+
+    def test_rescore_numeric_cluster_id_no_crash(self):
+        # HIGH-2 repro #3: a non-string clusterId (e.g. a number) must not
+        # crash the warning-message join.
+        code, out, _ = self._run(['open', '--question', 'Why?'])
+        sid = json.loads(out)['id']
+        self._run(['hypotheses', sid, '--json', json.dumps(VALID_HYPS)])
+        self._run(['observe', sid, '--text', 'an observation'])
+        matrix = [{'clusterId': 42, 'likelihoods': [{'hypothesisId': 'h-1', 'likelihood': 0.5}]}]
+        code, out, err = self._run(['rescore', sid, '--json', json.dumps(matrix)])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, '')
+        data = json.loads(out)
+        self.assertIn('warnings', data)
+        self.assertTrue(any('42' in w for w in data['warnings']))
 
     def test_rescore_full_flow(self):
         code, out, _ = self._run(['open', '--question', 'Why?'])
@@ -1044,6 +1196,22 @@ class TestCLI(unittest.TestCase):
 # =============================================================================
 
 SKILL_MD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'SKILL.md')
+README_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'README.md')
+
+
+class TestReadmeFidelity(unittest.TestCase):
+    def test_readme_state_diagram_has_no_stale_to_open_transition(self):
+        # HIGH-4: `observe` on a stale situation raises (add_observation
+        # requires status == 'open'); nothing reopens a stale situation.
+        # The state diagram must not claim otherwise.
+        with open(README_PATH) as f:
+            content = f.read()
+        self.assertNotIn('Stale --> Open', content)
+
+    def test_readme_mentions_concurrency_last_writer_wins(self):
+        with open(README_PATH) as f:
+            content = f.read()
+        self.assertIn('last-writer-wins', content.lower())
 
 
 class TestSkillMdFidelity(unittest.TestCase):
@@ -1073,13 +1241,56 @@ class TestSkillMdFidelity(unittest.TestCase):
     def test_skill_md_mentions_never_hand_edit_ledger(self):
         with open(SKILL_MD_PATH) as f:
             content = f.read()
-        self.assertIn('NEVER', content.upper() if False else content)
+        self.assertIn('NEVER', content)
         self.assertTrue('hand-edit' in content.lower() or 'never edit' in content.lower())
 
     def test_skill_md_mentions_no_filesystem_fallback(self):
         with open(SKILL_MD_PATH) as f:
             content = f.read()
         self.assertIn('claude.ai', content)
+
+    def test_skill_md_states_rescore_is_full_rescore_of_all_clusters(self):
+        # A live dogfooding run rescored only the clusters that were new
+        # since the last rescore; the rest got silently neutral-filled.
+        # SKILL.md must say, explicitly, that rescore needs the FULL
+        # cluster set every time.
+        with open(SKILL_MD_PATH) as f:
+            content = f.read()
+        self.assertIn('ALL clusters', content)
+
+    def test_skill_md_json_examples_are_valid_and_executable(self):
+        # MEDIUM-6: pin SKILL.md's example payloads character-for-character
+        # by actually running them through the real engine, not just
+        # grepping for key names.
+        with open(SKILL_MD_PATH) as f:
+            content = f.read()
+        # Fences in SKILL.md are indented (list items); allow leading
+        # whitespace on the closing fence line — json.loads doesn't care
+        # about indentation inside the captured block itself.
+        blocks = [json.loads(b) for b in re.findall(r'```json[ \t]*\n(.*?)\n[ \t]*```', content, re.DOTALL)]
+        self.assertGreaterEqual(len(blocks), 2)
+
+        hyps_block = next(b for b in blocks if isinstance(b, list) and 'predictedEvidence' in b[0])
+        matrix_block = next(b for b in blocks if isinstance(b, list) and 'likelihoods' in b[0])
+
+        store = hunch.new_store(now=1)
+        sit = open_situation(store)
+        hunch.apply_hypotheses(store, sit['id'], hyps_block, now=5)  # must not raise
+
+        cluster_id = matrix_block[0]['clusterId']
+        hunch.add_observation(store, sit['id'], text='seed observation for the doc example',
+                               force_new_cluster=True, now=10)
+        s = hunch.get_situation(store, sit['id'])
+        obs = s['observations'][-1]
+        obs['clusterId'] = cluster_id  # force the seeded cluster's id to match the doc's literal "c-1"
+
+        result = hunch.rescore(store, sit['id'], matrix_block, now=20)
+        self.assertEqual(result['warnings'], [], f"SKILL.md's matrix example doesn't cleanly score: {result['warnings']}")
+
+    def test_skill_md_mentions_concurrency_last_writer_wins(self):
+        with open(SKILL_MD_PATH) as f:
+            content = f.read()
+        self.assertIn('last-writer-wins', content.lower())
 
 
 class TestDemoSubprocess(unittest.TestCase):
@@ -1088,6 +1299,140 @@ class TestDemoSubprocess(unittest.TestCase):
         self.assertEqual(code, 0, err)
         data = json.loads(out)
         self.assertTrue(data['ok'])
+
+
+# =============================================================================
+# WP7 — install.sh
+# =============================================================================
+
+INSTALL_SH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'install.sh')
+
+
+@unittest.skipUnless(shutil.which('sh'), 'sh not available on this system')
+class TestInstallScript(unittest.TestCase):
+    def _run_install(self, args, cwd=None):
+        sh = shutil.which('sh')
+        proc = subprocess.run(
+            [sh, INSTALL_SH] + args,
+            cwd=cwd, capture_output=True, text=True,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def test_copy_install_to_target_dir_passes_smoke_test(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, 'hunch-installed')
+            code, out, err = self._run_install(['--copy', '--target', target])
+            self.assertEqual(code, 0, out + err)
+            self.assertIn('PASS', out)
+            self.assertTrue(os.path.isfile(os.path.join(target, 'hunch.py')),
+                             'expected a real copy of hunch.py at the target')
+            self.assertFalse(os.path.islink(target), '--copy must not leave a symlink')
+
+    def test_copy_install_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, 'hunch-installed')
+            code1, out1, err1 = self._run_install(['--copy', '--target', target])
+            self.assertEqual(code1, 0, out1 + err1)
+            code2, out2, err2 = self._run_install(['--copy', '--target', target])
+            self.assertEqual(code2, 0, out2 + err2)
+            self.assertIn('PASS', out2)
+
+    def test_refuses_to_clobber_foreign_directory_without_force(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, 'not-hunch')
+            os.makedirs(target)
+            with open(os.path.join(target, 'unrelated.txt'), 'w') as f:
+                f.write('do not touch me')
+            code, out, err = self._run_install(['--copy', '--target', target])
+            self.assertNotEqual(code, 0)
+            self.assertTrue(os.path.exists(os.path.join(target, 'unrelated.txt')),
+                             'foreign directory contents must survive a refused install')
+
+    def test_force_overwrites_foreign_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, 'not-hunch')
+            os.makedirs(target)
+            with open(os.path.join(target, 'unrelated.txt'), 'w') as f:
+                f.write('do not touch me')
+            code, out, err = self._run_install(['--copy', '--target', target, '--force'])
+            self.assertEqual(code, 0, out + err)
+            self.assertTrue(os.path.isfile(os.path.join(target, 'hunch.py')))
+
+    def test_run_from_inside_installed_copy_targeting_itself_is_safe(self):
+        # CRITICAL-1 repro: TARGET == SCRIPT_DIR (e.g. README's "cd
+        # ~/.claude/skills/hunch && ./install.sh") must NOT rm -rf the
+        # directory the running script itself lives in.
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, 'hunch-installed')
+            code, out, err = self._run_install(['--copy', '--target', target])
+            self.assertEqual(code, 0, out + err)
+            self.assertTrue(os.path.isfile(os.path.join(target, 'hunch.py')))
+
+            sh = shutil.which('sh')
+            proc = subprocess.run(
+                [sh, os.path.join(target, 'install.sh'), '--target', target],
+                cwd=target, capture_output=True, text=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertTrue(
+                os.path.isfile(os.path.join(target, 'hunch.py')),
+                'self-targeted install must not delete its own directory')
+            self.assertFalse(os.path.islink(target), 'self-target must not become a symlink to itself')
+
+    def test_run_from_inside_installed_copy_via_relative_target_is_safe(self):
+        # Same repro, but TARGET given as "." (logical pwd) instead of an
+        # absolute path matching SCRIPT_DIR verbatim.
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, 'hunch-installed')
+            code, out, err = self._run_install(['--copy', '--target', target])
+            self.assertEqual(code, 0, out + err)
+
+            sh = shutil.which('sh')
+            proc = subprocess.run(
+                [sh, os.path.join(target, 'install.sh'), '--target', '.'],
+                cwd=target, capture_output=True, text=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertTrue(os.path.isfile(os.path.join(target, 'hunch.py')))
+
+    def test_refuses_hunch_lookalike_with_extra_ledger_without_force(self):
+        # MEDIUM-5: a copy-install that has since accumulated a real
+        # .hunch/ ledger must not be silently rm -rf'd by a bare re-run.
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, 'hunch-installed')
+            code, out, err = self._run_install(['--copy', '--target', target])
+            self.assertEqual(code, 0, out + err)
+            ledger_dir = os.path.join(target, '.hunch')
+            os.makedirs(ledger_dir)
+            ledger_path = os.path.join(ledger_dir, 'ledger.json')
+            with open(ledger_path, 'w') as f:
+                f.write('{"schemaVersion": 1}')
+
+            code2, out2, err2 = self._run_install(['--copy', '--target', target])
+            self.assertNotEqual(code2, 0)
+            self.assertIn('.hunch', out2 + err2)
+            self.assertTrue(os.path.exists(ledger_path), 'ledger must survive a refused install')
+
+    def test_force_overwrites_hunch_lookalike_with_extra_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, 'hunch-installed')
+            code, out, err = self._run_install(['--copy', '--target', target])
+            self.assertEqual(code, 0, out + err)
+            os.makedirs(os.path.join(target, '.hunch'))
+            with open(os.path.join(target, '.hunch', 'ledger.json'), 'w') as f:
+                f.write('{"schemaVersion": 1}')
+
+            code2, out2, err2 = self._run_install(['--copy', '--target', target, '--force'])
+            self.assertEqual(code2, 0, out2 + err2)
+            self.assertTrue(os.path.isfile(os.path.join(target, 'hunch.py')))
+
+    def test_copy_install_excludes_pycache(self):
+        # LOW: --copy must not drag __pycache__ along.
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, 'hunch-installed')
+            code, out, err = self._run_install(['--copy', '--target', target])
+            self.assertEqual(code, 0, out + err)
+            self.assertFalse(os.path.isdir(os.path.join(target, '__pycache__')))
 
 
 if __name__ == '__main__':

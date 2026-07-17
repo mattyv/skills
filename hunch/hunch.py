@@ -82,8 +82,6 @@ STOPWORDS = {
     'you', 'your', 'per', 'via',
 }
 
-_TOKEN_STRIP_TABLE = {ord(c): ' ' for c in map(chr, range(0, 128)) if not (c.isalnum() or c.isspace())}
-
 
 def token_set(text):
     """Lowercase, strip non-alphanumeric to spaces, split, drop len<3 and
@@ -189,9 +187,10 @@ def resolve_ledger_path(flag, env_value, cwd=None):
     return os.path.join(base, '.hunch', 'ledger.json')
 
 
-def load_or_create_ledger(path, now, read_only=False):
+def load_or_create_ledger(path, now):
     """Mutating commands auto-create a missing ledger; read-only commands get
-    an empty-but-valid in-memory store instead (never touching disk).
+    an empty-but-valid in-memory store instead (never touching disk) — see
+    the `is_read_only` branch in `_dispatch`, which never calls this.
     """
     existing = load_ledger_or_none(path)
     if existing is not None:
@@ -654,6 +653,14 @@ def _index_matrix(matrix, cluster_by_id, active_ids, all_hypothesis_ids=None):
     (hypothesisId -> likelihood), dropping rows/cells referencing unknown
     clusters/hypotheses. Duplicate clusterId rows / duplicate hypothesisId
     cells within a row: the LAST occurrence wins wholesale.
+
+    `matrix` is only guaranteed to be a JSON-decoded value that passed
+    `isinstance(matrix, list)` (see rescore's top-level guard) — a valid
+    JSON array can still contain non-dict rows (`[1,2,3]`) or non-dict cells,
+    and dict rows/cells can hold non-string ids. None of that is allowed to
+    raise; it's tallied in `malformedCount` and surfaced as a warning
+    instead, matching this engine's JS counterpart's tolerance for
+    wrong-shaped-but-valid-JSON input.
     """
     if all_hypothesis_ids is None:
         all_hypothesis_ids = active_ids
@@ -668,8 +675,12 @@ def _index_matrix(matrix, cluster_by_id, active_ids, all_hypothesis_ids=None):
     seen_unknown_hyp = set()
     seen_inactive_hyp = set()
     seen_dup_cluster = set()
+    malformed_count = 0
 
     for row in (matrix or []):
+        if not isinstance(row, dict):
+            malformed_count += 1
+            continue
         cluster_id = row.get('clusterId')
         if cluster_id not in cluster_by_id:
             if cluster_id not in seen_unknown_cluster:
@@ -680,8 +691,14 @@ def _index_matrix(matrix, cluster_by_id, active_ids, all_hypothesis_ids=None):
             seen_dup_cluster.add(cluster_id)
             duplicate_cluster_ids.append(cluster_id)
 
+        likelihoods = row.get('likelihoods')
+        if not isinstance(likelihoods, list):
+            likelihoods = []
         cells = {}
-        for cell in (row.get('likelihoods') or []):
+        for cell in likelihoods:
+            if not isinstance(cell, dict):
+                malformed_count += 1
+                continue
             hid = cell.get('hypothesisId')
             if hid not in active_ids:
                 if hid in all_hypothesis_ids:
@@ -706,6 +723,7 @@ def _index_matrix(matrix, cluster_by_id, active_ids, all_hypothesis_ids=None):
         'inactiveHypothesisIds': inactive_hypothesis_ids,
         'duplicateClusterIds': duplicate_cluster_ids,
         'duplicateHypothesisCells': duplicate_hypothesis_cells,
+        'malformedCount': malformed_count,
     }
 
 
@@ -797,23 +815,35 @@ def compute_matrix_stats(matrix, clusters, active_hypotheses, all_hypotheses=Non
         'duplicateClusterIds': indexed['duplicateClusterIds'],
         'duplicateHypothesisCells': indexed['duplicateHypothesisCells'],
         'outOfRangeLikelihoods': out_of_range,
+        'malformedCount': indexed['malformedCount'],
     }
 
 
 def build_matrix_warnings(stats):
     """Human-readable warnings a model can act on without re-reading docs —
     naming unknown/inactive/duplicate ids inline enables one-shot self-correction.
+
+    Ids named here come straight from model-supplied JSON and are not
+    guaranteed to be strings (e.g. a numeric or null clusterId) — every join
+    below goes through str() so a malformed id can never crash this
+    function; it just gets printed as whatever it is.
     """
     unknown_parts = []
     if stats['unknownClusterIds']:
-        unknown_parts.append(f"unknown cluster ids: {', '.join(stats['unknownClusterIds'])}")
+        unknown_parts.append(f"unknown cluster ids: {', '.join(str(x) for x in stats['unknownClusterIds'])}")
     if stats['unknownHypothesisIds']:
-        unknown_parts.append(f"unknown hypothesis ids: {', '.join(stats['unknownHypothesisIds'])}")
+        unknown_parts.append(f"unknown hypothesis ids: {', '.join(str(x) for x in stats['unknownHypothesisIds'])}")
     if stats['inactiveHypothesisIds']:
-        unknown_parts.append(f"inactive (demoted) hypothesis ids: {', '.join(stats['inactiveHypothesisIds'])}")
+        unknown_parts.append(
+            f"inactive (demoted) hypothesis ids: {', '.join(str(x) for x in stats['inactiveHypothesisIds'])}")
     unknown_suffix = f" ({'; '.join(unknown_parts)})" if unknown_parts else ''
 
     warnings = []
+    if stats.get('malformedCount'):
+        warnings.append(
+            f"{stats['malformedCount']} malformed matrix rows/cells ignored — each row must be "
+            '{clusterId, likelihoods:[{hypothesisId, likelihood}]}'
+        )
     if stats['matchedCells'] == 0:
         warnings.append(
             'no matrix cells matched — posteriors equal priors; matrix rows must use cluster ids '
@@ -996,7 +1026,15 @@ def build_surface_text(store, sid):
         cluster_by_id = {c['id']: c for c in clusters}
         rationale_rows = []
         for row in (situation['lastScoring']['matrix'] or []):
-            cell = next((c for c in (row.get('likelihoods') or []) if c.get('hypothesisId') == top['id']), None)
+            # Persisted verbatim from whatever rescore was called with —
+            # may contain malformed rows/cells that _index_matrix already
+            # tolerates elsewhere; tolerate them here too rather than crash.
+            if not isinstance(row, dict):
+                continue
+            cell = next(
+                (c for c in (row.get('likelihoods') or [])
+                 if isinstance(c, dict) and c.get('hypothesisId') == top['id']),
+                None)
             if not cell:
                 continue
             rationale_rows.append({'likelihood': cell.get('likelihood'), 'rationale': cell.get('rationale'), 'clusterId': row.get('clusterId')})
@@ -1156,6 +1194,17 @@ def _read_payload(json_flag):
     return json.loads(raw)
 
 
+def _finite_float(raw):
+    """argparse type= for flags that feed straight into probability math —
+    rejects 'nan'/'inf'/'-inf' (which Python's float() otherwise happily
+    parses) so a typo can't silently poison a posterior calculation.
+    """
+    value = float(raw)
+    if not math.isfinite(value):
+        raise argparse.ArgumentTypeError(f'expected a finite number, got {raw!r}')
+    return value
+
+
 def _build_parser():
     parser = argparse.ArgumentParser(prog='hunch', description='Bayesian hypothesis tracking for explanation questions.')
     parser.add_argument('--ledger', default=None, help='Path to the ledger JSON file (overrides HUNCH_LEDGER and the default).')
@@ -1174,7 +1223,7 @@ def _build_parser():
     p_observe.add_argument('situation_id')
     p_observe.add_argument('--text', required=True)
     p_observe.add_argument('--source-type', default=None)
-    p_observe.add_argument('--reliability', type=float, default=None)
+    p_observe.add_argument('--reliability', type=_finite_float, default=None)
     p_observe.add_argument('--source-ref', default=None)
     cluster_group = p_observe.add_mutually_exclusive_group()
     cluster_group.add_argument('--same-event-as', default=None)
