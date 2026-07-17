@@ -40,7 +40,12 @@ TUNING = {
     'MAX_HYPOTHESES': 6,
     'NEUTRAL_LIKELIHOOD': 0.5,        # blend target for unreliable evidence
     'POSTERIOR_ZERO_EPSILON': 1e-12,  # float guard for "all raw posteriors are zero" checks
-    'RELIABILITY_DEFAULTS': {'firsthand': 1.0, 'secondhand': 0.6, 'rumor': 0.3, 'inferred': 0.5},
+    'RELIABILITY_DEFAULTS': {
+        'firsthand': 1.0, 'secondhand': 0.6, 'rumor': 0.3, 'inferred': 0.5,
+        # Outcome of a deliberate experiment -- the strongest provenance available:
+        # you controlled the variable and watched the effect, so it's treated like firsthand.
+        'intervention': 1.0,
+    },
     'CLUSTER_JACCARD_THRESHOLD': 0.6,
     'SURFACE_TOP_MIN': 0.65,          # "peaked" needs top above this...
     'SURFACE_LEAD_MIN': 0.25,         # ...and this much lead over runner-up
@@ -725,7 +730,18 @@ def _index_matrix(matrix, cluster_by_id, active_ids, all_hypothesis_ids=None):
 
 def compute_posteriors(hypotheses, clusters=None, matrix=None):
     """Full re-score of active hypotheses from priors. Pure, order-invariant.
-    Returns {'posteriors': {id: p}, 'entropy': float}.
+    Returns {'posteriors': {id: p}, 'entropy': float, 'fellBackToPriors': bool}.
+
+    Likelihoods are accumulated in log-space (sum of logs) rather than as a
+    raw running product: with enough evidence clusters, a raw product of
+    per-cluster likelihoods underflows to (numerically) zero well before the
+    evidence is actually uninformative -- e.g. 0.3 * 0.6**60 ~= 1.5e-14,
+    below POSTERIOR_ZERO_EPSILON, which would otherwise silently trigger the
+    "all hypotheses scored zero" fallback and discard 60 clusters of real
+    evidence. Normalizing via max-log subtraction before exponentiating
+    (a standard log-sum-exp technique) keeps this numerically stable while
+    producing the same posteriors as the raw-product math whenever that math
+    wasn't underflowing in the first place.
     """
     clusters = clusters or []
     matrix = matrix or []
@@ -740,21 +756,42 @@ def compute_posteriors(hypotheses, clusters=None, matrix=None):
         p = h.get('prior')
         return p if (_is_finite_number(p) and p > 0) else 0
 
-    raw = {}
-    raw_sum = 0
+    # log_likelihood[hid] is None once any single cluster's effective
+    # likelihood is exactly 0 -- a true zero on any cluster must zero the
+    # whole hypothesis (matching the old product semantics: one zero factor
+    # zeroes the product regardless of the other factors), so we stop
+    # accumulating and mark it as -inf rather than letting math.log(0) raise.
+    log_likelihood = {}
     for h in active:
-        product = 1
+        total = 0.0
+        zeroed = False
         for cluster in clusters:
             row = rows_by_cluster.get(cluster['id'])
             score = row.get(h['id']) if row is not None and h['id'] in row else None
-            product *= _effective_likelihood(score, cluster['reliability'])
-        prior = prior_of(h)
-        raw[h['id']] = prior * product
-        raw_sum += raw[h['id']]
+            eff = _effective_likelihood(score, cluster['reliability'])
+            if eff <= 0:
+                zeroed = True
+                break
+            total += math.log(eff)
+        log_likelihood[h['id']] = None if zeroed else total
 
-    if raw_sum > TUNING['POSTERIOR_ZERO_EPSILON']:
-        posteriors = {h['id']: raw[h['id']] / raw_sum for h in active}
+    log_raw = {}
+    for h in active:
+        prior = prior_of(h)
+        if log_likelihood[h['id']] is None or prior <= 0:
+            log_raw[h['id']] = None
+        else:
+            log_raw[h['id']] = math.log(prior) + log_likelihood[h['id']]
+
+    finite_logs = [v for v in log_raw.values() if v is not None]
+    fell_back_to_priors = False
+    if finite_logs:
+        max_log = max(finite_logs)
+        exp_vals = {hid: (math.exp(v - max_log) if v is not None else 0.0) for hid, v in log_raw.items()}
+        total_exp = sum(exp_vals.values())
+        posteriors = {hid: exp_vals[hid] / total_exp for hid in exp_vals}
     else:
+        fell_back_to_priors = True
         prior_sum = sum(prior_of(h) for h in active)
         if prior_sum > TUNING['POSTERIOR_ZERO_EPSILON']:
             posteriors = {h['id']: prior_of(h) / prior_sum for h in active}
@@ -775,7 +812,11 @@ def compute_posteriors(hypotheses, clusters=None, matrix=None):
             posteriors[hid] *= scale
         posteriors[other_id] = TUNING['OTHER_FLOOR']
 
-    return {'posteriors': posteriors, 'entropy': _normalized_entropy(posteriors)}
+    return {
+        'posteriors': posteriors,
+        'entropy': _normalized_entropy(posteriors),
+        'fellBackToPriors': fell_back_to_priors,
+    }
 
 
 def compute_matrix_stats(matrix, clusters, active_hypotheses, all_hypotheses=None):
@@ -958,6 +999,8 @@ def rescore(store, sid, matrix, now=None, trigger='manual'):
     posteriors = computed['posteriors']
     matrix_stats = compute_matrix_stats(matrix, clusters, active_hyps, situation['hypotheses'])
     warnings = build_matrix_warnings(matrix_stats)
+    if computed.get('fellBackToPriors'):
+        warnings.append('all hypotheses scored zero — posteriors fell back to priors')
 
     for h in active_hyps:
         if h['id'] in posteriors:

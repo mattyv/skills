@@ -84,6 +84,15 @@ first's, not merge with it.
    OTHER resets to its initial prior. Do this when `rescore` reports
    `regenerationSuggested: true`.
 
+   **Twin hypotheses — same observable evidence, different statements.** If
+   two candidate hypotheses predict the same observable evidence, either
+   merge them into one hypothesis until a discriminator exists, or keep both
+   but (a) write `predictedEvidence` emphasizing what DIFFERS between them
+   and (b) score their shared clusters identically in the likelihood matrix.
+   A flat verdict between twins is CORRECT output, not a tool failure — the
+   remedy is naming the specific discriminating observation that would tell
+   them apart, never scoring the shared evidence harder to force a split.
+
 3. **Record observations** as they come in, one per real-world data point:
 
    ```
@@ -92,12 +101,22 @@ first's, not merge with it.
    ```
 
    `--source-type` is one of `firsthand` / `secondhand` / `rumor` / `inferred`
-   (defaults to `inferred` if omitted). If this observation restates one you
-   already logged, pass `--same-event-as OBS_ID` to join its cluster instead
-   of creating a noisy duplicate. Otherwise the engine Jaccard-matches your
-   text against existing observations automatically — you rarely need to
-   think about clustering by hand. Use `--new-cluster` to force a fresh
-   cluster even for text that reads as a near-duplicate.
+   / `intervention` (defaults to `inferred` if omitted). `intervention` is
+   for the outcome of a deliberate experiment — you changed one variable and
+   watched what happened — and carries the same 1.0 reliability as
+   `firsthand`. Intervention outcomes are usually your strongest discriminators;
+   score their clusters decisively and asymmetrically rather than hedging
+   them toward the neutral middle. If this observation restates
+   one you already logged, pass `--same-event-as OBS_ID` to join its cluster
+   instead of creating a noisy duplicate. Otherwise the engine
+   Jaccard-matches your text against existing observations automatically —
+   you rarely need to think about clustering by hand. Use `--new-cluster` to
+   force a fresh cluster even for text that reads as a near-duplicate.
+
+   A resolved situation's outcome is itself a first-class observation for
+   another situation — chain them instead of re-litigating shared evidence:
+   `python3 hunch.py observe SIT2 --text "sit-1 resolved: <resolution>"
+   --source-type firsthand --source-ref sit-1`.
 
 4. **Get cluster ids to score against**: `python3 hunch.py clusters SIT`
    returns `[{ "id": "c-1", ... }]`. Build the likelihood matrix YOURSELF —

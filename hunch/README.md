@@ -107,8 +107,9 @@ total certainty about an incomplete list.
 
 **Reliability — not all evidence is equal.** A rumor nudges the numbers a
 little; something you observed firsthand moves them a lot. You tag each
-observation `firsthand` / `secondhand` / `rumor` / `inferred`, and the
-script weights the update accordingly.
+observation `firsthand` / `secondhand` / `rumor` / `inferred` / `intervention`,
+and the script weights the update accordingly. `intervention` — the outcome
+of a deliberate experiment — carries the same top reliability as `firsthand`.
 
 **Entropy — how spread-out the belief is.** Think of it as the difference
 between a 6-way tie and one clear leader. High entropy = still a toss-up,
@@ -371,9 +372,9 @@ $$
 - $L(c, H)$ — the model-elicited likelihood "P(evidence in cluster $c$ |
   $H$ is true)", clamped to $[0,1]$ before use.
 - $r_c$ — the cluster's reliability, derived from `--source-type`
-  (`firsthand`=1.0, `secondhand`=0.6, `rumor`=0.3, `inferred`=0.5) or an
-  explicit `--reliability` override; the bracketed term is the reliability
-  blend toward the neutral point 0.5.
+  (`firsthand`=1.0, `secondhand`=0.6, `rumor`=0.3, `inferred`=0.5,
+  `intervention`=1.0) or an explicit `--reliability` override; the bracketed
+  term is the reliability blend toward the neutral point 0.5.
 - The product runs over **every** evidence cluster for the situation — this
   is the naive-Bayes independence assumption (see limitations below).
 
@@ -433,3 +434,7 @@ data.
   claimed confidence actually landed there as often as they should have.
   Calibration says nothing until a meaningful number of situations — tens,
   not units — have resolved against independent ground truth.
+- **Hypotheses that predict identical evidence cannot be separated by that
+  evidence — in this or any formalism.** The tool's job is to say so (a flat
+  verdict) and name what would separate them, not to manufacture a
+  distinction.

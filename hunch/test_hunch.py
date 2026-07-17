@@ -54,6 +54,7 @@ class TestTuning(unittest.TestCase):
         self.assertEqual(t['POSTERIOR_ZERO_EPSILON'], 1e-12)
         self.assertEqual(t['RELIABILITY_DEFAULTS'], {
             'firsthand': 1.0, 'secondhand': 0.6, 'rumor': 0.3, 'inferred': 0.5,
+            'intervention': 1.0,
         })
         self.assertEqual(t['CLUSTER_JACCARD_THRESHOLD'], 0.6)
         self.assertEqual(t['SURFACE_TOP_MIN'], 0.65)
@@ -292,6 +293,13 @@ class TestClustering(unittest.TestCase):
         self.assertEqual(obs[0]['provenance']['reliability'], 0.9)
         self.assertEqual(obs[1]['provenance']['reliability'], 0.3)
         self.assertEqual(obs[2]['provenance']['reliability'], 0.5)  # inferred default
+
+    def test_source_type_intervention_resolves_reliability_1(self):
+        store = hunch.new_store(now=1)
+        sit = open_situation(store)
+        hunch.add_observation(store, sit['id'], text='a', source_type='intervention', now=1)
+        obs = hunch.get_situation(store, sit['id'])['observations']
+        self.assertEqual(obs[0]['provenance']['reliability'], 1.0)
 
     def test_observe_on_non_open_situation_errors(self):
         store = hunch.new_store(now=1)
@@ -574,6 +582,69 @@ class TestPosteriorMath(unittest.TestCase):
         for hid in ('h-1', 'h-2', 'other'):
             self.assertAlmostEqual(result['posteriors'][hid], 1 / 3, places=9)
 
+    def _make_underflow_matrix(self, num_clusters):
+        hyps = [
+            {'id': 'h-1', 'status': 'active', 'prior': 0.3},
+            {'id': 'h-2', 'status': 'active', 'prior': 0.55},
+            {'id': 'other', 'status': 'active', 'prior': 0.15},
+        ]
+        clusters = [{'id': f'c-{i}', 'reliability': 1.0} for i in range(1, num_clusters + 1)]
+        matrix = [{'clusterId': c['id'], 'likelihoods': [
+            {'hypothesisId': 'h-1', 'likelihood': 0.6},
+            {'hypothesisId': 'h-2', 'likelihood': 0.1},
+            {'hypothesisId': 'other', 'likelihood': 0.1},
+        ]} for c in clusters]
+        return hyps, clusters, matrix
+
+    def test_log_space_accumulation_prevents_underflow_at_60_clusters(self):
+        # Raw-product accumulation underflows POSTERIOR_ZERO_EPSILON well before
+        # the evidence is actually uninformative: 0.3 * 0.6**60 ~= 1.47e-14,
+        # which is BELOW POSTERIOR_ZERO_EPSILON (1e-12) even though h-1 is by
+        # far the best-supported hypothesis here. The zero-sum fallback must
+        # not fire in this case -- h-1 should dominate (capped by the OTHER
+        # floor at ~0.95), not fall back to priors (which would leave h-2,
+        # the prior-favorite, still "in the lead").
+        hyps, clusters, matrix = self._make_underflow_matrix(60)
+        result = hunch.compute_posteriors(hypotheses=hyps, clusters=clusters, matrix=matrix)
+        self.assertAlmostEqual(result['posteriors']['h-1'], 0.95, places=6)
+        self.assertAlmostEqual(result['posteriors']['other'], 0.05, places=6)
+        self.assertLess(result['posteriors']['h-2'], 0.01)
+        self.assertFalse(result.get('fellBackToPriors', False))
+
+    def test_log_space_matches_non_underflowing_20_cluster_truncation(self):
+        # Same matrix shape truncated to 20 clusters never underflows even
+        # under the old raw-product math -- confirms the log-space rewrite
+        # doesn't change results in the regime where the old code was already
+        # correct (same asymptotic answer: h-1 dominant, OTHER-floored).
+        hyps, clusters, matrix = self._make_underflow_matrix(20)
+        result = hunch.compute_posteriors(hypotheses=hyps, clusters=clusters, matrix=matrix)
+        self.assertAlmostEqual(result['posteriors']['h-1'], 0.95, places=6)
+        self.assertAlmostEqual(result['posteriors']['other'], 0.05, places=6)
+
+    def test_zero_sum_fallback_sets_flag_and_only_then(self):
+        # The all-zero-evidence fallback-to-priors case must be flagged so
+        # callers (rescore) can surface a warning -- but the flag must NOT be
+        # set in ordinary scoring, including the 60-cluster underflow case
+        # above, which log-space now resolves without falling back at all.
+        store = hunch.new_store(now=1)
+        sit = open_situation(store)
+        hunch.apply_hypotheses(store, sit['id'], VALID_HYPS, now=5)
+        s = hunch.get_situation(store, sit['id'])
+        active_hyps = [h for h in s['hypotheses'] if h['status'] == 'active']
+        hunch.add_observation(store, sit['id'], text='zeroing observation', reliability=1.0, now=10)
+        clusters = hunch.get_clusters(store, sit['id'])
+        zero_matrix = [{'clusterId': clusters[0]['id'], 'likelihoods': [
+            {'hypothesisId': h['id'], 'likelihood': 0.0} for h in active_hyps
+        ]}]
+        zero_result = hunch.compute_posteriors(hypotheses=active_hyps, clusters=clusters, matrix=zero_matrix)
+        self.assertTrue(zero_result.get('fellBackToPriors', False))
+
+        normal_matrix = [{'clusterId': clusters[0]['id'], 'likelihoods': [
+            {'hypothesisId': h['id'], 'likelihood': 0.7} for h in active_hyps
+        ]}]
+        normal_result = hunch.compute_posteriors(hypotheses=active_hyps, clusters=clusters, matrix=normal_matrix)
+        self.assertFalse(normal_result.get('fellBackToPriors', False))
+
     def test_duplicate_row_dedupe_last_wins_wholesale(self):
         store = hunch.new_store(now=1)
         sit, o1, o2 = _setup_matrix_situation(store)
@@ -778,6 +849,20 @@ class TestDecideSurfacing(unittest.TestCase):
 
 
 class TestRescore(unittest.TestCase):
+    def test_rescore_warns_when_all_hypotheses_scored_zero(self):
+        store = hunch.new_store(now=1)
+        sit = open_situation(store)
+        hunch.apply_hypotheses(store, sit['id'], VALID_HYPS, now=5)
+        s = hunch.get_situation(store, sit['id'])
+        active_hyps = [h for h in s['hypotheses'] if h['status'] == 'active']
+        hunch.add_observation(store, sit['id'], text='zeroing observation', reliability=1.0, now=10)
+        clusters = hunch.get_clusters(store, sit['id'])
+        zero_matrix = [{'clusterId': clusters[0]['id'], 'likelihoods': [
+            {'hypothesisId': h['id'], 'likelihood': 0.0} for h in active_hyps
+        ]}]
+        result = hunch.rescore(store, sit['id'], zero_matrix, now=20)
+        self.assertTrue(any('fell back to priors' in w for w in result['warnings']))
+
     def test_guard_not_open(self):
         store = hunch.new_store(now=1)
         sit = open_situation(store)
@@ -1045,6 +1130,18 @@ class TestCLI(unittest.TestCase):
         clusters = json.loads(out)
         self.assertEqual(len(clusters), 1)
 
+    def test_observe_accepts_intervention_source_type(self):
+        code, out, _ = self._run(['open', '--question', 'Why?'])
+        sid = json.loads(out)['id']
+        code, out, err = self._run(['observe', sid, '--text', 'we disabled the cache and the errors stopped',
+                                     '--source-type', 'intervention'])
+        self.assertEqual(code, 0, err)
+        code, out, err = self._run(['get', sid])
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertEqual(data['observations'][0]['sourceType'], 'intervention')
+        self.assertEqual(data['observations'][0]['reliability'], 1.0)
+
     def test_observe_reliability_nan_rejected(self):
         code, out, _ = self._run(['open', '--question', 'Why?'])
         sid = json.loads(out)['id']
@@ -1213,6 +1310,17 @@ class TestReadmeFidelity(unittest.TestCase):
             content = f.read()
         self.assertIn('last-writer-wins', content.lower())
 
+    def test_readme_honest_limitations_mentions_identical_evidence(self):
+        with open(README_PATH) as f:
+            content = f.read()
+        self.assertIn('identical evidence', content)
+        self.assertIn('cannot be separated', content)
+
+    def test_readme_mentions_intervention_reliability(self):
+        with open(README_PATH) as f:
+            content = f.read()
+        self.assertIn('intervention', content)
+
 
 class TestSkillMdFidelity(unittest.TestCase):
     def test_skill_md_exists_with_frontmatter(self):
@@ -1257,6 +1365,24 @@ class TestSkillMdFidelity(unittest.TestCase):
         with open(SKILL_MD_PATH) as f:
             content = f.read()
         self.assertIn('ALL clusters', content)
+
+    def test_skill_md_mentions_intervention_source_type(self):
+        with open(SKILL_MD_PATH) as f:
+            content = f.read()
+        self.assertIn('intervention', content)
+        self.assertIn('strongest discriminators', content)
+
+    def test_skill_md_mentions_twin_hypotheses_guidance(self):
+        with open(SKILL_MD_PATH) as f:
+            content = f.read()
+        self.assertIn('same observable evidence', content)
+        self.assertIn('flat verdict', content)
+
+    def test_skill_md_mentions_chaining_situations(self):
+        with open(SKILL_MD_PATH) as f:
+            content = f.read()
+        self.assertIn('--source-ref sit-1', content)
+        self.assertIn('first-class observation', content)
 
     def test_skill_md_json_examples_are_valid_and_executable(self):
         # MEDIUM-6: pin SKILL.md's example payloads character-for-character
