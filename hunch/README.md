@@ -222,13 +222,22 @@ and write to the ledger, and every number derived from it, goes through
 
 | Artifact | What it is |
 |---|---|
-| `.hunch/ledger.json` | The state file — every situation, hypothesis, observation, cluster, and posterior history. Lives in the current working directory of wherever Claude runs the `hunch.py` command, unless overridden with `--ledger` or the `HUNCH_LEDGER` environment variable. It's human-readable JSON, but **do not hand-edit it** — see "What makes this trustworthy" above for why. Safe to delete: that's how you make `hunch` forget everything. Safe to commit to a repo if you want shared, versioned hunches across a team — but think before you do, since hypothesis and observation text can contain workplace-sensitive content. |
+| `.hunch/ledger.json` | The state file — every situation, hypothesis, observation, cluster, and posterior history. Lives in the current working directory of wherever Claude runs the `hunch.py` command, unless overridden with `--ledger` or the `HUNCH_LEDGER` environment variable. It's human-readable JSON, but **do not hand-edit it** — see "What makes this trustworthy" above for why. Safe to delete: that's how you make `hunch` forget everything. Safe to commit to a repo if you want shared, versioned hunches across a team — but think before you do, since hypothesis and observation text can contain workplace-sensitive content. Git here is transport and backup for a single logical writer — ledgers from diverged branches can't be meaningfully merged (situation/observation ids are per-ledger sequence numbers), so resolve a conflict by picking one side, not by splicing. |
 | `.hunch/ledger.json.tmp*` | Transient atomic-write temp files (`save_ledger` writes to a tempfile in the same directory, then `os.replace`s it over the real ledger). Auto-cleaned on every successful write; you'd only ever see one mid-write or after a crash between the write and the rename. |
 | Demo artifacts | `hunch.py demo` runs its walkthrough against a throwaway ledger in a temp directory (`hunch-demo-*`), auto-removed at the end unless you pass `--keep`. |
 | `~/.claude/skills/hunch` | Created by `install.sh` — a symlink to your checkout by default, or a full copy with `--copy`. |
 
 Nothing else. `hunch` writes nowhere else: no caches beyond the ledger
 itself, no config files, no telemetry.
+
+**And it never touches the network. This is a guarantee, not a current
+status:** `hunch.py` will never open a socket, fetch a URL, phone home, or
+check for updates — in any future version. Evidence gathering is the
+model's job, using the model's own tools under the host's permission
+system; observations enter through `observe --text` and are attributed via
+`--source-ref`. A test (`TestNoNetworkGuarantee`) pins this: any import
+beyond the audited stdlib allowlist fails the suite. If a future change
+needs the network, it is by definition not a change to `hunch`.
 
 ## FAQ
 
@@ -253,6 +262,16 @@ an audit trail, not just a cache. Hand-editing a belief (or a past
 calibration entry) breaks the link between "what evidence was observed"
 and "what was believed," which is the entire value of tracking this over
 time instead of just asking the model to reason fresh each session.
+
+**Why doesn't `hunch.py` fetch evidence itself?** Fetching wouldn't make
+observations more trustworthy — the likelihood judgment is still the
+model's opinion about the content, wherever the bytes came from. What it
+*would* do: bypass the host's permission prompts for network access, and
+write raw, attacker-influenceable web content into a ledger that gets
+re-read into the model's context every session — a persistent
+prompt-injection vector. The script stays a bookkeeper that never handles
+content; `--source-ref` records where evidence came from, `--source-type`
+records how much to trust it.
 
 **Is it safe to run more than one `hunch.py` invocation at once?** Only
 one invocation against a given ledger at a time. `save_ledger` writes

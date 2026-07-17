@@ -6,6 +6,7 @@ Run with:
     python3 -m unittest test_hunch -v
     python3 -m pytest test_hunch.py -q
 """
+import ast
 import json
 import math
 import os
@@ -1432,6 +1433,62 @@ class TestInstallScript(unittest.TestCase):
             code, out, err = self._run_install(['--copy', '--target', target])
             self.assertEqual(code, 0, out + err)
             self.assertFalse(os.path.isdir(os.path.join(target, '__pycache__')))
+
+
+# =============================================================================
+# No-network guarantee — pins hunch.py to a stdlib-only, network-free
+# import surface. See README.md's "it never touches the network" guarantee.
+# =============================================================================
+
+class TestNoNetworkGuarantee(unittest.TestCase):
+    ALLOWED_IMPORTS = {
+        '__future__', 'argparse', 'json', 'math', 'os', 'sys', 'tempfile',
+        'time', 'shutil',
+    }
+
+    def test_imports_are_allowlisted(self):
+        with open(HUNCH_PY) as f:
+            tree = ast.parse(f.read(), filename=HUNCH_PY)
+
+        found = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    found.add(alias.name.split('.')[0])
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    found.add(node.module.split('.')[0])
+
+        extra = found - self.ALLOWED_IMPORTS
+        self.assertFalse(
+            extra,
+            f'hunch.py imports {extra} beyond the audited allowlist '
+            f'{self.ALLOWED_IMPORTS}. This is a change to the no-network '
+            f'guarantee documented in README.md and must be reviewed as such.'
+        )
+
+    def test_no_network_modules_loaded_transitively(self):
+        network_modules = ('socket', 'ssl', 'http', 'urllib', 'ftplib', 'smtplib', 'xmlrpc')
+        code = (
+            "import sys\n"
+            "import hunch\n"
+            "loaded = sorted(m for m in sys.modules if m.split('.')[0] in "
+            + repr(network_modules) + ")\n"
+            "print(','.join(loaded))\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, '-c', code],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        loaded = [m for m in proc.stdout.strip().split(',') if m]
+        self.assertEqual(
+            loaded, [],
+            f'importing hunch pulled in network-capable modules: {loaded}. '
+            f'This is a change to the no-network guarantee documented in '
+            f'README.md and must be reviewed as such.'
+        )
 
 
 if __name__ == '__main__':
