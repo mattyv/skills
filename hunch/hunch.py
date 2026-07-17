@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """hunch — Bayesian hypothesis tracking for explanation questions.
 
-A portable, zero-dependency (Python 3.9+ stdlib only) port of the TARS
-Abduction Engine (abduction-lib.js) plus the tokenSet/jaccard fuzzy-dedupe
-helper from cue-light-dedupe.js. The model (Claude) supplies judgment —
+A portable, zero-dependency (Python 3.9+ stdlib only) abductive-reasoning
+engine with a text-similarity dedupe helper. The model (Claude) supplies judgment —
 hypotheses, likelihood matrices, cluster assignments — this script does the
 honest Bayesian bookkeeping and owns a JSON ledger the model never
 hand-edits directly.
@@ -28,9 +27,8 @@ import tempfile
 import time
 
 # =============================================================================
-# Layer 1: TUNING — all tuning knobs, ported verbatim from ABDUCTION_TUNING
-# (js/abduction-lib.js:19-44). Grouped in one dict so every threshold this
-# engine uses is discoverable and adjustable in one place.
+# Layer 1: TUNING — all tuning knobs, grouped in one dict so every threshold
+# this engine uses is discoverable and adjustable in one place.
 # =============================================================================
 
 TUNING = {
@@ -70,11 +68,11 @@ SCHEMA_VERSION = 1
 
 # =============================================================================
 # Layer 2: Dedupe — tokenSet/jaccard fuzzy matching, ported from
-# cue-light-dedupe.js. Only tokenSet/jaccard are ported (no ticketSet, no
+# a fuzzy-dedupe helper. Only token-set/jaccard similarity (no ticket matching, no
 # isDuplicate/record — those are Q-Light-specific and out of scope here).
 # =============================================================================
 
-# Verbatim 32-word stopword list from cue-light-dedupe.js:14-19.
+# 32-word English stopword list for token-set similarity.
 STOPWORDS = {
     'the', 'and', 'for', 'with', 'that', 'this', 'from', 'has', 'not', 'but',
     'are', 'was', 'its', 'they', 'have', 'been', 'will', 'their', 'also',
@@ -85,7 +83,7 @@ STOPWORDS = {
 
 def token_set(text):
     """Lowercase, strip non-alphanumeric to spaces, split, drop len<3 and
-    stopwords, dedupe preserving order. Mirrors cue-light-dedupe.js tokenSet.
+    stopwords, dedupe preserving order.
     """
     if not text or not isinstance(text, str):
         return []
@@ -199,7 +197,7 @@ def load_or_create_ledger(path, now):
 
 
 # =============================================================================
-# Layer 3: Engine — pure functions on a plain dict store. TARS parity: all
+# Layer 3: Engine — pure functions on a plain dict store. Wire-format rule: all
 # timestamps are injected via a `now` parameter (epoch ms), never computed
 # here. All JSON wire keys stay camelCase — see module docstring.
 # =============================================================================
@@ -643,9 +641,7 @@ def calibration_summary(store):
 
 
 # =============================================================================
-# Posterior math + matrix stats/warnings — ported from _indexMatrix,
-# _computePosteriors, _computeMatrixStats, _buildMatrixWarnings
-# (js/abduction-lib.js:250-489).
+# Posterior math + matrix stats/warnings.
 # =============================================================================
 
 def _index_matrix(matrix, cluster_by_id, active_ids, all_hypothesis_ids=None):
@@ -873,9 +869,7 @@ def normalized_entropy(posteriors):
 
 
 # =============================================================================
-# Surfacing verdicts + rescore + surface text — ported from _decideSurfacing,
-# rescore, _unobservedDiscriminators, _buildSurfaceText
-# (js/abduction-lib.js:491-636, 1213-1312).
+# Surfacing verdicts + rescore + surface text.
 # =============================================================================
 
 def decide_surfacing(posteriors, hypotheses, last_surfaced_top_id):

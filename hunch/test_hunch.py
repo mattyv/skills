@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Tests for hunch.py — the portable Bayesian hypothesis-tracking engine.
 
-Ported from the TARS Abduction Engine (abduction-lib.js) and its dedupe
-helper (cue-light-dedupe.js). Organized by work package (WP0-WP6), matching
-the implementation brief. Run with:
+Organized by work package (WP0-WP6), matching the implementation brief.
+Run with:
     python3 -m unittest test_hunch -v
     python3 -m pytest test_hunch.py -q
 """
