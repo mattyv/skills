@@ -51,8 +51,10 @@ knock things off the shelf at 3am?" Claude invents a handful of plausible
 explanations and, for each one, writes down what you'd expect to see if it
 were true. As real observations come in, you feed them to the script.
 `hunch.py` does the arithmetic honestly — no vibes, no rounding in its
-head — and only tells you it has an answer once the numbers actually point
-somewhere.
+head — and only tells you it has an answer once Claude's own likelihood
+judgments, consistently accounted, actually point somewhere. The script
+guarantees the accounting, not the judgments: it can stop drift and
+double-counting, but it cannot add information the model didn't supply.
 
 **Why does a script do the math instead of the model?** Judging "how
 surprising is this evidence" is exactly the kind of fuzzy call a language
@@ -410,3 +412,5 @@ data.
   entire reason the calibration ledger exists: `python3 hunch.py
   calibration` checks, after the fact, whether situations resolved at a
   claimed confidence actually landed there as often as they should have.
+  Calibration says nothing until a meaningful number of situations — tens,
+  not units — have resolved against independent ground truth.

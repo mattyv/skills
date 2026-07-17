@@ -149,6 +149,9 @@ first's, not merge with it.
      the surface text).
    - `peaked` or `flip`: state the leading hypothesis and its posterior,
      but still show the full distribution — a peaked belief can be wrong.
+     Never quote a posterior past two decimals, and report anything at or
+     above 0.9 as "at/near the engine's 0.95 ceiling" — the OTHER floor
+     caps every non-OTHER posterior at 0.95 by construction.
    - `confused`: OTHER has crossed 0.35. Say the current hypothesis set
      doesn't explain the evidence and propose new hypotheses (step 7).
 
