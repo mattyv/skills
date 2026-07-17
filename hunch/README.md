@@ -1,5 +1,9 @@
 # hunch
 
+<p align="center">
+  <img src="cover.jpeg" alt="hunch — a meerkat standing watch" width="340">
+</p>
+
 A hunch ledger. Claude proposes explanations, `hunch.py` does the honest
 arithmetic, so beliefs update instead of resetting every conversation.
 
