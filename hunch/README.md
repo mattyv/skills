@@ -12,6 +12,8 @@ protocol (`SKILL.md`) and one zero-dependency Python script that owns the
 math and the data (`hunch.py`). No build step, no external packages, no
 server.
 
+Current release: **hunch 1.1.0** (ledger schema 2). This release adds explicit hypothesis challenges, immutable prospective forecasts, strict scoring snapshots, and Brier evaluation. Existing schema-1 ledgers remain readable. Run `python3 hunch.py migrate` before writing to one; the command creates a `.v1.bak` backup first and marks old posterior entries without their original matrices as non-reconstructable.
+
 ## Install
 
 From a clone of this repo:
@@ -52,8 +54,7 @@ install`.
 
 You have an open question — "why is the deploy flaky?", "why does the cat
 knock things off the shelf at 3am?" Claude invents a handful of plausible
-explanations and, for each one, writes down what you'd expect to see if it
-were true. As real observations come in, you feed them to the script.
+explanations and, for each one, writes down what you'd expect to see if it were true, its strongest credible counterargument, and a concrete result that would weaken it. These challenges make the reasoning inspectable; they do not automatically change the probabilities. As real observations come in, you feed them to the script.
 `hunch.py` does the arithmetic honestly — no vibes, no rounding in its
 head — and only tells you it has an answer once Claude's own likelihood
 judgments, consistently accounted, actually point somewhere. The script
@@ -109,6 +110,10 @@ of the field looks. That's deliberate: a hypothesis list dreamed up before
 seeing much evidence is often incomplete, and the tool should never claim
 total certainty about an incomplete list.
 
+**Challenge — the strongest current reason an explanation could be wrong.** It is labelled observed, unobserved, or none identified. An observed challenge must cite ledger observations; an unobserved objection cannot masquerade as evidence. Updating challenge text preserves history and does not change a posterior.
+
+**Forecast — a frozen probability commitment.** A forecast records its target, horizon, resolution rule, full distribution, evidence cutoff, and the scoring inputs available at commitment time. Later evidence and rescoring cannot alter it. Independent target resolution lets `forecast-report` calculate Brier loss without using confidence recorded after the answer was known.
+
 **Reliability — not all evidence is equal.** A rumor nudges the numbers a
 little; something you observed firsthand moves them a lot. You tag each
 observation `firsthand` / `secondhand` / `rumor` / `inferred` / `intervention`,
@@ -139,16 +144,13 @@ sequenceDiagram
 
     Claude->>Script: rescore(situation, evidence-vs-explanation matrix)
     Script->>Ledger: read current situation
-    Script->>Script: drop duplicate rows, clamp out-of-range scores,<br/>collect warnings for anything malformed
+    Script->>Script: validate every matrix cell; reject incomplete or malformed input
     Script->>Script: recompute updated belief from scratch<br/>(not a running average — a full redo)
     Script->>Ledger: append this update to the history, save
-    Script-->>Claude: verdict + full belief breakdown + any warnings
+    Script-->>Claude: verdict + full belief breakdown
 ```
 
-If `warnings` comes back non-empty, something in the matrix you sent
-didn't land cleanly (wrong id, a value outside 0–1, a duplicate row). Fix
-the matrix and rescore again — don't relay a result you know is built on a
-warning.
+By default, `rescore` rejects a missing, malformed, duplicate, unknown, or out-of-range cell before changing the ledger. Fix the matrix and retry. `--allow-incomplete` is an explicit compatibility mode that preserves the older neutral-fill behavior and marks the scoring snapshot incomplete.
 
 ## A situation's life
 
@@ -227,7 +229,7 @@ and write to the ledger, and every number derived from it, goes through
 
 | Artifact | What it is |
 |---|---|
-| `.hunch/ledger.json` | The state file — every situation, hypothesis, observation, cluster, and posterior history. Lives in the current working directory of wherever Claude runs the `hunch.py` command, unless overridden with `--ledger` or the `HUNCH_LEDGER` environment variable. It's human-readable JSON, but **do not hand-edit it** — see "What makes this trustworthy" above for why. Safe to delete: that's how you make `hunch` forget everything. Safe to commit to a repo if you want shared, versioned hunches across a team — but think before you do, since hypothesis and observation text can contain workplace-sensitive content. Git here is transport and backup for a single logical writer — ledgers from diverged branches can't be meaningfully merged (situation/observation ids are per-ledger sequence numbers), so resolve a conflict by picking one side, not by splicing. |
+| `.hunch/ledger.json` | The state file — every situation, hypothesis, challenge revision, observation, cluster, scoring snapshot, forecast, target resolution, and posterior history. Lives in the current working directory of wherever Claude runs the `hunch.py` command, unless overridden with `--ledger` or the `HUNCH_LEDGER` environment variable. It's human-readable JSON, but **do not hand-edit it** — see "What makes this trustworthy" above for why. Safe to delete: that's how you make `hunch` forget everything. Safe to commit to a repo if you want shared, versioned hunches across a team — but think before you do, since hypothesis and observation text can contain workplace-sensitive content. Git here is transport and backup for a single logical writer — ledgers from diverged branches can't be meaningfully merged (situation/observation ids are per-ledger sequence numbers), so resolve a conflict by picking one side, not by splicing. |
 | `.hunch/ledger.json.tmp*` | Transient atomic-write temp files (`save_ledger` writes to a tempfile in the same directory, then `os.replace`s it over the real ledger). Auto-cleaned on every successful write; you'd only ever see one mid-write or after a crash between the write and the rename. |
 | Demo artifacts | `hunch.py demo` runs its walkthrough against a throwaway ledger in a temp directory (`hunch-demo-*`), auto-removed at the end unless you pass `--keep`. |
 | `~/.claude/skills/hunch` | Created by `install.sh` — a symlink to your checkout by default, or a full copy with `--copy`. |
@@ -285,6 +287,8 @@ corrupt the file — but they're still last-writer-wins: two invocations
 that both read, then both write, will silently drop whichever one lost
 the race, not merge. Don't run `hunch` commands against the same
 `--ledger` concurrently.
+
+See [EVALUATION.md](EVALUATION.md) for the evidence behind this release and the limits on accuracy and calibration claims.
 
 ## Testing
 

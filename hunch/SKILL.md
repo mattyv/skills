@@ -64,20 +64,28 @@ first's, not merge with it.
      {
        "statement": "The deploy pipeline is flaky because of a race condition in the cache warm step",
        "prior": 0.4,
-       "predictedEvidence": ["failures cluster right after a cache-clearing deploy", "retrying the same deploy succeeds"]
+       "predictedEvidence": ["failures cluster right after a cache-clearing deploy", "retrying the same deploy succeeds"],
+      "challenge": {"status": "unobserved", "counterargument": "Resource starvation could produce the same restart-sensitive symptoms", "observationIds": [], "weakeningPrediction": "Failures remain equally frequent with the cache path bypassed under matched load", "test": "Compare matched runs with and without the cache path"},
+      "candidateSetChallenge": {"status": "unobserved", "counterargument": "All named explanations may be inadequate", "observationIds": [], "weakeningPrediction": "A verified cause falls outside the named set", "test": "Independently verify the incident cause"}
      },
      {
        "statement": "The pipeline runner is resource-starved under concurrent load",
        "prior": 0.3,
-       "predictedEvidence": ["failures cluster with high concurrent deploy count", "CPU/memory metrics spike during failures"]
+       "predictedEvidence": ["failures cluster with high concurrent deploy count", "CPU/memory metrics spike during failures"],
+      "challenge": {"status": "unobserved", "counterargument": "A cache race could correlate with load", "observationIds": [], "weakeningPrediction": "Failures persist when resource headroom is increased", "test": "Repeat under matched load with increased resources"}
      },
      {
        "statement": "A flaky third-party dependency the pipeline calls out to is unreliable",
        "prior": 0.3,
-       "predictedEvidence": ["failures correlate with that dependency's own incident reports"]
+       "predictedEvidence": ["failures correlate with that dependency's own incident reports"],
+      "challenge": {"status": "unobserved", "counterargument": "Local failures may coincide with dependency traffic", "observationIds": [], "weakeningPrediction": "Failures continue while the dependency is bypassed", "test": "Run a matched dependency-bypass test"}
      }
    ]
    ```
+
+   Every named hypothesis also requires `challenge`. Put the separate candidate-set challenge in `candidateSetChallenge` on the first array item. `status` is `observed`, `unobserved`, or `noneIdentified`. Observed challenges must cite same-situation `observationIds`; unobserved challenges must cite none. Supply `counterargument`, `weakeningPrediction`, and `test`, or set `notIdentifiable: true` with a reason. `noneIdentified` also requires a short `considered` explanation.
+
+   Update a challenge later with `python3 hunch.py challenge SIT HYP --json '{...}'`. Use hypothesis id `other` for the candidate-set challenge. Each edit appends history and leaves priors, likelihoods, and posteriors unchanged. Revisit the leader's challenge whenever the leader changes.
 
    Calling `hypotheses` again on the same situation is how you regenerate —
    old hypotheses are demoted (never deleted), a new generation starts, and
@@ -104,9 +112,7 @@ first's, not merge with it.
    / `intervention` (defaults to `inferred` if omitted). `intervention` is
    for the outcome of a deliberate experiment — you changed one variable and
    watched what happened — and carries the same 1.0 reliability as
-   `firsthand`. Intervention outcomes are usually your strongest discriminators;
-   score their clusters decisively and asymmetrically rather than hedging
-   them toward the neutral middle. If this observation restates
+   `firsthand`. An intervention is not automatically diagnostic. Score it according to the experiment, controls, noise, and how differently the hypotheses predict its result. If this observation restates
    one you already logged, pass `--same-event-as OBS_ID` to join its cluster
    instead of creating a noisy duplicate. Otherwise the engine
    Jaccard-matches your text against existing observations automatically —
@@ -133,7 +139,7 @@ first's, not merge with it.
        "likelihoods": [
          { "hypothesisId": "h-1", "likelihood": 0.85, "rationale": "matches the cache-step failure pattern exactly" },
          { "hypothesisId": "h-2", "likelihood": 0.2, "rationale": "no evidence of resource starvation" },
-         { "hypothesisId": "h-3", "likelihood": 0.15, "rationale": "no mention of the third-party dependency" },
+         { "hypothesisId": "h-3", "likelihood": 0.5, "rationale": "the dependency was not monitored, so its state is unknown" },
          { "hypothesisId": "other", "likelihood": 0.15, "rationale": "doesn't rule out an unknown cause" }
        ]
      }
@@ -151,12 +157,7 @@ first's, not merge with it.
    in the result will tell you if cells came up short; treat that as a bug
    in your matrix, not background noise.
 
-5. **Check `warnings` in the rescore result before doing anything else.**
-   A non-empty `warnings` array means part or all of your matrix didn't
-   land — wrong cluster ids, wrong hypothesis ids, duplicate rows, malformed
-   rows/cells, or out-of-range values that got silently clamped. Fix your
-   matrix and rescore again; don't relay a result you know is built on a
-   warning.
+5. **Complete the matrix before saving.** `rescore` rejects missing, malformed, duplicate, unknown, or out-of-range cells without changing the ledger. Fix the matrix and retry. `--allow-incomplete` preserves the old neutral-fill behavior for explicit compatibility use and marks the saved snapshot incomplete.
 
 6. **Verdict gating — only conclude on `peaked`, `flip`, or `confused`.**
    Always relay the FULL posterior distribution and discriminators via
@@ -184,7 +185,9 @@ first's, not merge with it.
    set, it never deletes them, and calibration/history stay intact across
    the regeneration.
 
-8. **Resolve** when the question is actually answered:
+8. **Freeze a forecast before the outcome is known** when you want to test confidence. `forecast SIT --json '{...}'` commits an immutable binary or categorical distribution together with its evidence cutoff, horizon, resolution criteria, source label, and complete scoring inputs. Superseding creates a new forecast. Record independent ground truth with `target-resolve TARGET --json '{...}'`, then use `forecast-report`. Retrospective imports and forecasts committed after the outcome time are excluded from prospective scores. Unknown outcomes remain unresolved.
+
+9. **Resolve** when the explanation question itself is actually answered:
    `python3 hunch.py resolve SIT --resolution h-2` (or
    `--resolution "other: it turned out to be a hardware fault"` if the true
    answer wasn't in your candidate set — note the literal `other:` prefix).
@@ -201,10 +204,15 @@ first's, not merge with it.
 | Command | Purpose |
 |---|---|
 | `open --question TEXT [--entity-ref REF]` | Start a new situation (seeds the OTHER hypothesis) |
-| `hypotheses SIT [--json ARR \| stdin]` | Set/regenerate hypotheses (3-6, each with predictedEvidence) |
+| `hypotheses SIT [--json ARR \| stdin]` | Set/regenerate 3-6 hypotheses with predicted evidence and challenges |
+| `challenge SIT HYP [--json OBJ \| stdin]` | Supersede a challenge without changing probabilities |
 | `observe SIT --text TEXT [--source-type T] [--reliability F] [--same-event-as OBS \| --new-cluster]` | Log an observation |
 | `clusters SIT` | List observation clusters (score against these ids) |
-| `rescore SIT [--json ARR \| stdin] [--trigger STR]` | Score hypotheses against a likelihood matrix |
+| `rescore SIT [--json ARR \| stdin] [--trigger STR]` | Strict full-matrix score; `--allow-incomplete` is compatibility-only |
+| `forecast SIT [--json OBJ \| stdin]` | Freeze an immutable prospective forecast |
+| `target-resolve TARGET [--json OBJ \| stdin]` | Record independent outcome evidence |
+| `forecast-report` | Brier scores, accuracy, unresolved targets, and reliability bins |
+| `migrate` | Back up and explicitly upgrade a legacy ledger |
 | `get SIT` | Full detail view: hypotheses, observations, clusters, history, surface text |
 | `list [--status open\|stale\|resolved]` | Summary rows across situations |
 | `surface SIT` | Current surface text only |

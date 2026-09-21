@@ -29,21 +29,22 @@ something you set, it's structural.
 
 ## 2. Propose hypotheses
 
-Four suspects, each with a `statement` and `predictedEvidence` — the things
-you'd expect to actually observe if that suspect did it. The priors below
+Four suspects, each with predicted evidence and an explicit challenge. The first item also carries the separate candidate-set challenge for OTHER. The priors below
 deliberately don't sum to `0.85` (they're all `0.5`) to demonstrate that the
 engine renormalizes them, not you:
 
 ```bash
 python3 hunch.py hypotheses sit-1 --json '[
   {"statement": "Colonel Mustard did it in the library with the candlestick",
-   "prior": 0.5, "predictedEvidence": ["Mustard seen near library", "candlestick moved"]},
+   "prior": 0.5, "predictedEvidence": ["Mustard seen near library", "candlestick moved"],
+   "challenge": {"status": "unobserved", "counterargument": "Another suspect could fit these clues", "observationIds": [], "weakeningPrediction": "Mustard has a verified alibi", "test": "Verify alibis independently"},
+   "candidateSetChallenge": {"status": "unobserved", "counterargument": "The culprit may be outside the named set", "observationIds": [], "weakeningPrediction": "Access records identify another culprit", "test": "Check complete access records"}},
   {"statement": "Professor Plum did it in the study with the revolver",
-   "prior": 0.5, "predictedEvidence": ["Plum seen near study", "revolver fired"]},
+   "prior": 0.5, "predictedEvidence": ["Plum seen near study", "revolver fired"], "challenge": {"status": "unobserved", "counterargument": "Another suspect could fit", "observationIds": [], "weakeningPrediction": "Plum has a verified alibi", "test": "Verify alibis independently"}},
   {"statement": "Miss Scarlett did it in the lounge with the rope",
-   "prior": 0.5, "predictedEvidence": ["Scarlett seen near lounge", "rope missing"]},
+   "prior": 0.5, "predictedEvidence": ["Scarlett seen near lounge", "rope missing"], "challenge": {"status": "unobserved", "counterargument": "Another suspect could fit", "observationIds": [], "weakeningPrediction": "Scarlett has a verified alibi", "test": "Verify alibis independently"}},
   {"statement": "Mrs. Peacock did it in the kitchen with the lead pipe",
-   "prior": 0.5, "predictedEvidence": ["Peacock seen near kitchen", "lead pipe missing"]}
+   "prior": 0.5, "predictedEvidence": ["Peacock seen near kitchen", "lead pipe missing"], "challenge": {"status": "unobserved", "counterargument": "Another suspect could fit", "observationIds": [], "weakeningPrediction": "Peacock has a verified alibi", "test": "Verify alibis independently"}}
 ]'
 ```
 

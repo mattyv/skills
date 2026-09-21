@@ -7,6 +7,7 @@ Run with:
     python3 -m pytest test_hunch.py -q
 """
 import ast
+import copy
 import json
 import math
 import os
@@ -135,7 +136,7 @@ class TestLedgerIO(unittest.TestCase):
             store = hunch.new_store(now=1000)
             hunch.save_ledger(path, store)
             loaded = hunch.load_ledger(path)
-            self.assertEqual(loaded['schemaVersion'], 1)
+            self.assertEqual(loaded['schemaVersion'], 2)
             self.assertEqual(loaded['createdAt'], 1000)
             self.assertEqual(loaded['situations']['seq'], 0)
 
@@ -194,10 +195,19 @@ def open_situation(store, question='Why did the widget break?', now=1000, entity
     return hunch.open_situation(store, question=question, now=now, entity_ref=entity_ref)
 
 
+def challenge(counterargument="A competing explanation could fit", weakening="A matched test does not show the predicted difference"):
+    return {
+        "status": "unobserved", "counterargument": counterargument,
+        "observationIds": [], "weakeningPrediction": weakening,
+        "test": "Run a matched comparison while holding other conditions fixed",
+    }
+
+
 VALID_HYPS = [
-    {'statement': 'The widget overheated', 'prior': 0.4, 'predictedEvidence': ['temp logs show spike']},
-    {'statement': 'A bad firmware update shipped', 'prior': 0.3, 'predictedEvidence': ['deploy log around break time']},
-    {'statement': 'Physical damage from shipping', 'prior': 0.3, 'predictedEvidence': ['visible dents', 'shipping report']},
+    {"statement": "The widget overheated", "prior": 0.4, "predictedEvidence": ["temp logs show spike"],
+     "challenge": challenge(), "candidateSetChallenge": challenge("All named causes may be inadequate", "A verified cause falls outside the named set")},
+    {"statement": "A bad firmware update shipped", "prior": 0.3, "predictedEvidence": ["deploy log around break time"], "challenge": challenge()},
+    {"statement": "Physical damage from shipping", "prior": 0.3, "predictedEvidence": ["visible dents", "shipping report"], "challenge": challenge()},
 ]
 
 
@@ -366,9 +376,9 @@ class TestApplyHypotheses(unittest.TestCase):
         store = hunch.new_store(now=1)
         sit = open_situation(store)
         hyps = [
-            {'statement': 'A', 'prior': -1, 'predictedEvidence': ['x']},
-            {'statement': 'B', 'prior': float('nan'), 'predictedEvidence': ['y']},
-            {'statement': 'C', 'prior': 0.5, 'predictedEvidence': ['z']},
+            {"statement": "A", "prior": -1, "predictedEvidence": ["x"], "challenge": challenge(), "candidateSetChallenge": challenge()},
+            {"statement": "B", "prior": float("nan"), "predictedEvidence": ["y"], "challenge": challenge()},
+            {"statement": "C", "prior": 0.5, "predictedEvidence": ["z"], "challenge": challenge()},
         ]
         hunch.apply_hypotheses(store, sit['id'], hyps, now=5)
         s = hunch.get_situation(store, sit['id'])
@@ -1062,7 +1072,7 @@ class TestComputeResiduals(unittest.TestCase):
         hunch.add_observation(store, sit['id'], text='never scored', reliability=1.0, now=10)
         clusters = hunch.get_clusters(store, sit['id'])
         # rescore with an empty matrix: no rows at all for this cluster.
-        hunch.rescore(store, sit['id'], [], now=11)
+        hunch.rescore(store, sit['id'], [], now=11, allow_incomplete=True)
 
         result = hunch.compute_residuals(store, sit['id'])
         self.assertTrue(result['scored'])
@@ -1285,7 +1295,7 @@ class TestCLI(unittest.TestCase):
         sid = json.loads(out)['id']
         self._run(['hypotheses', sid, '--json', json.dumps(VALID_HYPS)])
         self._run(['observe', sid, '--text', 'an observation'])
-        code, out, err = self._run(['rescore', sid, '--json', json.dumps([1, 2, 3])])
+        code, out, err = self._run(['rescore', sid, '--json', json.dumps([1, 2, 3]), '--allow-incomplete'])
         self.assertEqual(code, 0, err)
         self.assertEqual(err, '')
         data = json.loads(out)
@@ -1299,7 +1309,7 @@ class TestCLI(unittest.TestCase):
         self._run(['hypotheses', sid, '--json', json.dumps(VALID_HYPS)])
         self._run(['observe', sid, '--text', 'an observation'])
         matrix = [{'likelihoods': [{'hypothesisId': 'h-1', 'likelihood': 0.5}]}]
-        code, out, err = self._run(['rescore', sid, '--json', json.dumps(matrix)])
+        code, out, err = self._run(['rescore', sid, '--json', json.dumps(matrix), '--allow-incomplete'])
         self.assertEqual(code, 0, err)
         self.assertEqual(err, '')
         data = json.loads(out)
@@ -1313,7 +1323,7 @@ class TestCLI(unittest.TestCase):
         self._run(['hypotheses', sid, '--json', json.dumps(VALID_HYPS)])
         self._run(['observe', sid, '--text', 'an observation'])
         matrix = [{'clusterId': 42, 'likelihoods': [{'hypothesisId': 'h-1', 'likelihood': 0.5}]}]
-        code, out, err = self._run(['rescore', sid, '--json', json.dumps(matrix)])
+        code, out, err = self._run(['rescore', sid, '--json', json.dumps(matrix), '--allow-incomplete'])
         self.assertEqual(code, 0, err)
         self.assertEqual(err, '')
         data = json.loads(out)
@@ -1501,7 +1511,7 @@ class TestSkillMdFidelity(unittest.TestCase):
         with open(SKILL_MD_PATH) as f:
             content = f.read()
         self.assertIn('intervention', content)
-        self.assertIn('strongest discriminators', content)
+        self.assertIn('not automatically diagnostic', content)
 
     def test_skill_md_mentions_twin_hypotheses_guidance(self):
         with open(SKILL_MD_PATH) as f:
@@ -1699,7 +1709,7 @@ class TestInstallScript(unittest.TestCase):
 
 class TestNoNetworkGuarantee(unittest.TestCase):
     ALLOWED_IMPORTS = {
-        '__future__', 'argparse', 'json', 'math', 'os', 'sys', 'tempfile',
+        '__future__', 'argparse', 'copy', 'hashlib', 'json', 'math', 'os', 'sys', 'tempfile',
         'time', 'shutil',
     }
 
@@ -1746,6 +1756,80 @@ class TestNoNetworkGuarantee(unittest.TestCase):
             f'This is a change to the no-network guarantee documented in '
             f'README.md and must be reviewed as such.'
         )
+
+
+class TestInspectableForecastRelease(unittest.TestCase):
+    def test_missing_challenge_is_actionable(self):
+        store = hunch.new_store(1)
+        sit = open_situation(store)
+        bad = [dict(item) for item in VALID_HYPS]
+        bad[1].pop("challenge")
+        with self.assertRaisesRegex(ValueError, "hypothesis 1 requires a challenge"):
+            hunch.apply_hypotheses(store, sit["id"], bad, now=2)
+
+    def test_observed_challenge_rejects_unknown_id(self):
+        store = hunch.new_store(1)
+        sit = open_situation(store)
+        bad = [dict(item) for item in VALID_HYPS]
+        bad[1]["challenge"] = dict(challenge(), status="observed", observationIds=["obs-999"])
+        with self.assertRaisesRegex(ValueError, "unknown observation ids"):
+            hunch.apply_hypotheses(store, sit["id"], bad, now=2)
+
+    def test_challenge_update_preserves_posterior(self):
+        store = hunch.new_store(1)
+        sit = open_situation(store)
+        hunch.apply_hypotheses(store, sit["id"], VALID_HYPS, now=2)
+        before = {h["id"]: h["posterior"] for h in sit["hypotheses"]}
+        event = hunch.update_challenge(store, sit["id"], "h-1", challenge("A revised objection"), now=3)
+        after = {h["id"]: h["posterior"] for h in sit["hypotheses"]}
+        self.assertEqual(before, after)
+        self.assertEqual(event["previous"]["status"], "unobserved")
+
+    def test_strict_rescore_rejection_leaves_state_unchanged(self):
+        store = hunch.new_store(1)
+        sit = open_situation(store)
+        hunch.apply_hypotheses(store, sit["id"], VALID_HYPS, now=2)
+        hunch.add_observation(store, sit["id"], "one observation", now=3)
+        before = copy.deepcopy(store)
+        with self.assertRaisesRegex(ValueError, "ledger unchanged"):
+            hunch.rescore(store, sit["id"], [], now=4)
+        self.assertEqual(store, before)
+
+    def test_frozen_forecast_and_independent_resolution(self):
+        store = hunch.new_store(1)
+        sit = open_situation(store)
+        hunch.apply_hypotheses(store, sit["id"], VALID_HYPS, now=2)
+        payload = {
+            "targetId": "t-1", "target": "Will the held-out probe pass?", "kind": "binary",
+            "outcomeLabels": ["yes", "no"], "probabilities": {"yes": 0.7, "no": 0.3},
+            "probabilitySource": "modelElicited", "horizon": "next run",
+            "resolutionCriteria": "independent test result", "evidenceCutoffAt": 5,
+        }
+        forecast = hunch.create_forecast(store, sit["id"], payload, now=5)
+        frozen = copy.deepcopy(forecast)
+        hunch.add_observation(store, sit["id"], "revealing later evidence", now=6)
+        self.assertEqual(store["forecasts"][0], frozen)
+        hunch.resolve_target(store, "t-1", "yes", observed_at=10, evidence_refs=["held-out-1"], rationale="verified", now=11)
+        report = hunch.forecast_summary(store)
+        self.assertAlmostEqual(report["meanBrierLoss"], 0.09)
+        with self.assertRaisesRegex(ValueError, "already resolved"):
+            hunch.resolve_target(store, "t-1", "yes", 10, [], "duplicate", now=12)
+
+    def test_brier_validation(self):
+        with self.assertRaises(ValueError):
+            hunch.brier_binary(float("nan"), 1)
+        with self.assertRaises(ValueError):
+            hunch.brier_binary(0.5, True)
+        with self.assertRaises(ValueError):
+            hunch.brier_categorical({"a": .8, "b": .3}, ["a", "b"], "a")
+
+    def test_migration_is_explicit_and_non_mutating(self):
+        legacy = {"schemaVersion": 1, "createdAt": 1, "situations": {"seq": 0, "items": {}}}
+        before = copy.deepcopy(legacy)
+        migrated = hunch.migrate_store(legacy)
+        self.assertEqual(legacy, before)
+        self.assertEqual(migrated["schemaVersion"], 2)
+        self.assertIn("forecasts", migrated)
 
 
 if __name__ == '__main__':

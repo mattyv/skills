@@ -19,9 +19,12 @@ end-to-end walkthrough.
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
 import json
 import math
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -68,7 +71,9 @@ TUNING = {
 # month math stays consistent with STALE_AFTER_MS above.
 MS_PER_MONTH = 30 * 24 * 3600 * 1000
 
-SCHEMA_VERSION = 1
+ENGINE_VERSION = '1.1.0'
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 
 
 # =============================================================================
@@ -133,6 +138,9 @@ def new_store(now):
         'schemaVersion': SCHEMA_VERSION,
         'createdAt': now,
         'situations': {'seq': 0, 'items': {}},
+        'forecastSeq': 0,
+        'forecasts': [],
+        'targetResolutions': [],
     }
 
 
@@ -172,12 +180,39 @@ def load_ledger(path):
             'fix or move the file; hunch will NOT overwrite it'
         ) from e
     version = store.get('schemaVersion') if isinstance(store, dict) else None
-    if version != SCHEMA_VERSION:
+    if version not in SUPPORTED_SCHEMA_VERSIONS:
         raise LedgerError(
-            f'ledger file "{path}" has schemaVersion {version!r}, expected {SCHEMA_VERSION}; '
+            f'ledger file "{path}" has schemaVersion {version!r}, expected one of '
+            f'{SUPPORTED_SCHEMA_VERSIONS}; '
             'fix or move the file; hunch will NOT overwrite it'
         )
     return store
+
+
+def migrate_store(store):
+    """Return a schema-v2 copy. Merely reading a v1 ledger never mutates it."""
+    version = store.get("schemaVersion")
+    if version == SCHEMA_VERSION:
+        return copy.deepcopy(store)
+    if version != 1:
+        raise LedgerError(f"cannot migrate schemaVersion {version!r}")
+    migrated = copy.deepcopy(store)
+    migrated["schemaVersion"] = SCHEMA_VERSION
+    migrated.setdefault("forecastSeq", 0)
+    migrated.setdefault("forecasts", [])
+    migrated.setdefault("targetResolutions", [])
+    for situation in (migrated.get("situations") or {}).get("items", {}).values():
+        situation.setdefault("candidateSetChallenge", None)
+        situation.setdefault("challengeHistory", [])
+        situation.setdefault("scoringHistory", [])
+        for hypothesis in situation.get("hypotheses", []):
+            if hypothesis.get("id") != TUNING["OTHER_ID"] and "challenge" not in hypothesis:
+                hypothesis["challenge"] = None
+                hypothesis["challengeRequired"] = True
+        for entry in situation.get("posteriorHistory", []):
+            if "matrix" not in entry:
+                entry["reconstructable"] = False
+    return migrated
 
 
 def resolve_ledger_path(flag, env_value, cwd=None):
@@ -355,6 +390,9 @@ def open_situation(store, question=None, entity_ref=None, now=None):
         'observations': [],
         'posteriorHistory': [],
         'lastScoring': None,
+        'scoringHistory': [],
+        'candidateSetChallenge': None,
+        'challengeHistory': [],
         'lastSurfacedTopId': None,
         'calibration': [],
         'hSeq': 0,
@@ -473,6 +511,40 @@ def get_clusters(store, sid):
     return clusters
 
 
+def _validate_challenge(challenge, observation_ids, label):
+    if not isinstance(challenge, dict):
+        raise ValueError(f"{label} requires a challenge object")
+    status = challenge.get("status")
+    if status not in ("observed", "unobserved", "noneIdentified"):
+        raise ValueError(f"{label} challenge.status must be observed, unobserved, or noneIdentified")
+    counterargument = challenge.get("counterargument")
+    if not isinstance(counterargument, str) or not counterargument.strip():
+        raise ValueError(f"{label} challenge requires a non-empty counterargument")
+    refs = challenge.get("observationIds", [])
+    if not isinstance(refs, list) or any(not isinstance(x, str) for x in refs):
+        raise ValueError(f"{label} challenge.observationIds must be an array of strings")
+    unknown = [x for x in refs if x not in observation_ids]
+    if unknown:
+        raise ValueError(f"{label} challenge references unknown observation ids: {', '.join(unknown)}")
+    if status == "observed" and not refs:
+        raise ValueError(f"{label} observed challenge requires observationIds")
+    if status != "observed" and refs:
+        raise ValueError(f"{label} {status} challenge must not cite observationIds")
+    weakening = challenge.get("weakeningPrediction")
+    test = challenge.get("test")
+    not_identifiable = challenge.get("notIdentifiable") is True
+    if not not_identifiable:
+        if not isinstance(weakening, str) or not weakening.strip():
+            raise ValueError(f"{label} challenge requires weakeningPrediction")
+        if not isinstance(test, str) or not test.strip():
+            raise ValueError(f"{label} challenge requires test")
+    elif not isinstance(challenge.get("reason"), str) or not challenge.get("reason").strip():
+        raise ValueError(f"{label} notIdentifiable challenge requires reason")
+    if status == "noneIdentified" and (not isinstance(challenge.get("considered"), str) or not challenge.get("considered").strip()):
+        raise ValueError(f"{label} noneIdentified challenge requires considered")
+    return copy.deepcopy(challenge)
+
+
 def apply_hypotheses(store, sid, hyps, now=None):
     situation = _require_situation(store, sid)
     if situation['status'] != 'open':
@@ -484,6 +556,12 @@ def apply_hypotheses(store, sid, hyps, now=None):
             f"apply_hypotheses: expected between {TUNING['MIN_HYPOTHESES']} and "
             f"{TUNING['MAX_HYPOTHESES']} hypotheses, got {got}"
         )
+
+    observation_ids = {o["id"] for o in situation["observations"]}
+    candidate_challenge = _validate_challenge(
+        hyps[0].get("candidateSetChallenge") if isinstance(hyps[0], dict) else None,
+        observation_ids, "candidate set")
+    validated_challenges = []
 
     for i, h in enumerate(hyps):
         statement = h.get('statement') if isinstance(h, dict) else None
@@ -500,6 +578,8 @@ def apply_hypotheses(store, sid, hyps, now=None):
                 f'apply_hypotheses: hypothesis {i} ("{snippet}") requires "predictedEvidence" to be a '
                 'non-empty array of non-empty strings (the discriminators this hypothesis predicts)'
             )
+        validated_challenges.append(_validate_challenge(
+            h.get("challenge"), observation_ids, f"hypothesis {i}"))
 
     raw_weights = []
     for h in hyps:
@@ -530,10 +610,18 @@ def apply_hypotheses(store, sid, hyps, now=None):
             'posterior': scaled_priors[i],
             'status': 'active',
             'predictedEvidence': h['predictedEvidence'],
+            'challenge': validated_challenges[i],
+            'challengeRequired': False,
             'generation': new_generation,
         })
 
     situation['hypotheses'].extend(new_hyps)
+    situation['candidateSetChallenge'] = candidate_challenge
+    situation.setdefault('challengeHistory', []).append({
+        'timestamp': now, 'generation': new_generation,
+        'hypotheses': [{ 'hypothesisId': h['id'], 'challenge': copy.deepcopy(h['challenge']) } for h in new_hyps],
+        'candidateSetChallenge': copy.deepcopy(candidate_challenge),
+    })
 
     other = next((h for h in situation['hypotheses'] if h['id'] == TUNING['OTHER_ID']), None)
     if other:
@@ -542,6 +630,32 @@ def apply_hypotheses(store, sid, hyps, now=None):
         other['status'] = 'active'
 
     return situation
+
+
+def update_challenge(store, sid, hypothesis_id, challenge, now=None, supersedes=None):
+    situation = _require_situation(store, sid)
+    if situation["status"] != "open":
+        raise ValueError(f"challenge: situation {sid} is not open")
+    observation_ids = {o["id"] for o in situation["observations"]}
+    validated = _validate_challenge(challenge, observation_ids, f"hypothesis {hypothesis_id}")
+    previous = None
+    if hypothesis_id == TUNING["OTHER_ID"]:
+        previous = situation.get("candidateSetChallenge")
+        situation["candidateSetChallenge"] = validated
+    else:
+        hypothesis = next((h for h in situation["hypotheses"] if h["id"] == hypothesis_id), None)
+        if not hypothesis:
+            raise ValueError(f"challenge: unknown hypothesis id {hypothesis_id}")
+        previous = hypothesis.get("challenge")
+        hypothesis["challenge"] = validated
+        hypothesis["challengeRequired"] = False
+    event = {
+        "timestamp": now, "hypothesisId": hypothesis_id,
+        "challenge": copy.deepcopy(validated), "previous": copy.deepcopy(previous),
+        "supersedes": supersedes,
+    }
+    situation.setdefault("challengeHistory", []).append(event)
+    return event
 
 
 def resolve(store, sid, resolution=None, now=None):
@@ -980,7 +1094,7 @@ RESCORE_SIGNATURE = (
 )
 
 
-def rescore(store, sid, matrix, now=None, trigger='manual'):
+def rescore(store, sid, matrix, now=None, trigger='manual', allow_incomplete=False):
     situation = _require_situation(store, sid)
     if not isinstance(matrix, list):
         raise ValueError(f'rescore: {RESCORE_SIGNATURE}')
@@ -999,6 +1113,8 @@ def rescore(store, sid, matrix, now=None, trigger='manual'):
     posteriors = computed['posteriors']
     matrix_stats = compute_matrix_stats(matrix, clusters, active_hyps, situation['hypotheses'])
     warnings = build_matrix_warnings(matrix_stats)
+    if warnings and not allow_incomplete:
+        raise ValueError('rescore: incomplete matrix rejected; ledger unchanged: ' + '; '.join(warnings))
     if computed.get('fellBackToPriors'):
         warnings.append('all hypotheses scored zero — posteriors fell back to priors')
 
@@ -1007,8 +1123,17 @@ def rescore(store, sid, matrix, now=None, trigger='manual'):
             h['posterior'] = posteriors[h['id']]
 
     entropy_for_audit = _normalized_entropy(posteriors)
-    situation['lastScoring'] = {'timestamp': now, 'matrix': matrix, 'entropy': entropy_for_audit}
-    situation['posteriorHistory'].append({'timestamp': now, 'posteriors': posteriors, 'trigger': trigger})
+    snapshot = {
+        'timestamp': now, 'matrix': copy.deepcopy(matrix),
+        'entropy': entropy_for_audit, 'posteriors': copy.deepcopy(posteriors),
+        'trigger': trigger, 'complete': not bool(warnings),
+        'reconstructable': True, 'configuration': copy.deepcopy(TUNING),
+    }
+    situation['lastScoring'] = copy.deepcopy(snapshot)
+    situation.setdefault('scoringHistory', []).append(copy.deepcopy(snapshot))
+    situation['posteriorHistory'].append({
+        'timestamp': now, 'posteriors': posteriors, 'trigger': trigger,
+        'matrix': copy.deepcopy(matrix), 'reconstructable': True})
     if len(situation['posteriorHistory']) > TUNING['POSTERIOR_HISTORY_CAP']:
         situation['posteriorHistory'] = situation['posteriorHistory'][-TUNING['POSTERIOR_HISTORY_CAP']:]
 
@@ -1095,6 +1220,15 @@ def build_surface_text(store, sid):
             runner_up_unobserved = _unobserved_discriminators(situation, runner_up)
             expect = '; '.join(runner_up_unobserved) if runner_up_unobserved else 'no distinguishing evidence yet'
             lines.append(f"If instead {runner_up['statement']}: expect {expect}")
+
+        challenge = top.get('challenge') or {}
+        if challenge.get('status') == 'observed':
+            lines.append(f"Strongest observed challenge: {challenge.get('counterargument')}")
+        elif challenge:
+            lines.append(f"Unresolved challenge: {challenge.get('counterargument')}")
+        candidate = situation.get('candidateSetChallenge') or {}
+        if candidate:
+            lines.append(f"Candidate-set check: {candidate.get('weakeningPrediction') or candidate.get('counterargument')}")
 
     return '\n'.join(lines)
 
@@ -1205,6 +1339,8 @@ def build_detail_view(store, sid):
         'id': h['id'], 'statement': h['statement'], 'posterior': h['posterior'],
         'prior': h['prior'], 'status': h['status'], 'generation': h['generation'],
         'predictedEvidence': h['predictedEvidence'],
+        'challenge': h.get('challenge'),
+        'challengeRequired': h.get('challengeRequired', h['id'] != TUNING['OTHER_ID'] and 'challenge' not in h),
     } for h in hypotheses]
 
     observations = sorted(situation['observations'], key=lambda o: (o['timestamp'] if o['timestamp'] is not None else 0), reverse=True)
@@ -1247,6 +1383,191 @@ def build_detail_view(store, sid):
         'lastScoring': last_scoring,
         'surfaceText': build_surface_text(store, sid),
         'calibration': situation['calibration'],
+        'candidateSetChallenge': situation.get('candidateSetChallenge'),
+        'challengeHistory': situation.get('challengeHistory', []),
+        'forecasts': [copy.deepcopy(f) for f in store.get('forecasts', []) if f.get('situationId') == sid],
+    }
+
+
+
+def _validate_probability_vector(labels, probabilities):
+    if not isinstance(labels, list) or len(labels) < 2 or len(set(labels)) != len(labels):
+        raise ValueError("forecast: outcomeLabels must contain at least two unique strings")
+    if any(not isinstance(label, str) or not label.strip() for label in labels):
+        raise ValueError("forecast: outcomeLabels must be non-empty strings")
+    if not isinstance(probabilities, dict) or set(probabilities) != set(labels):
+        raise ValueError("forecast: probabilities must contain exactly every outcome label")
+    values = list(probabilities.values())
+    if any(not _is_finite_number(value) or value < 0 for value in values):
+        raise ValueError("forecast: probabilities must be finite, non-negative numbers (booleans are invalid)")
+    if not math.isclose(sum(values), 1.0, rel_tol=0, abs_tol=1e-9):
+        raise ValueError("forecast: probabilities must sum to 1")
+
+
+def _stable_hash(record):
+    encoded = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def create_forecast(store, sid, payload, now=None):
+    situation = _require_situation(store, sid)
+    if situation["status"] != "open":
+        raise ValueError("forecast: situation must be open")
+    if not isinstance(payload, dict):
+        raise ValueError("forecast: payload must be an object")
+    target_id = payload.get("targetId")
+    target = payload.get("target")
+    labels = payload.get("outcomeLabels")
+    probabilities = payload.get("probabilities")
+    if not isinstance(target_id, str) or not target_id.strip():
+        raise ValueError("forecast: targetId is required")
+    if not isinstance(target, str) or not target.strip():
+        raise ValueError("forecast: target wording is required")
+    _validate_probability_vector(labels, probabilities)
+    kind = payload.get("kind")
+    if kind not in ("binary", "categorical") or (kind == "binary" and len(labels) != 2):
+        raise ValueError("forecast: kind must be binary (two labels) or categorical")
+    source = payload.get("probabilitySource")
+    if source not in ("modelElicited", "empiricallyEstimated", "computedModel"):
+        raise ValueError("forecast: probabilitySource must be modelElicited, empiricallyEstimated, or computedModel")
+    for field in ("horizon", "resolutionCriteria"):
+        if not isinstance(payload.get(field), str) or not payload[field].strip():
+            raise ValueError(f"forecast: {field} is required")
+    if any(r.get("targetId") == target_id and r.get("status") == "resolved" for r in store.get("targetResolutions", [])):
+        raise ValueError("forecast: target is already resolved")
+    active = [h for h in situation["hypotheses"] if h["status"] == "active"]
+    generations = {h.get("generation") for h in active if h["id"] != TUNING["OTHER_ID"]}
+    snapshot = {
+        "hypothesisGeneration": max(generations) if generations else None,
+        "hypotheses": [{"id": h["id"], "prior": h.get("prior"), "posterior": h.get("posterior")} for h in active],
+        "observationIds": [o["id"] for o in situation["observations"]],
+        "eventGroups": [{"clusterId": c["id"], "memberIds": c["memberIds"]} for c in get_clusters(store, sid)],
+        "likelihoodMatrix": copy.deepcopy((situation.get("lastScoring") or {}).get("matrix")),
+        "reliabilitySettings": copy.deepcopy(TUNING["RELIABILITY_DEFAULTS"]),
+        "configuration": copy.deepcopy(TUNING),
+        "engineVersion": ENGINE_VERSION,
+    }
+    store["forecastSeq"] = store.get("forecastSeq", 0) + 1
+    record = {
+        "id": f"fc-{store['forecastSeq']}", "situationId": sid,
+        "targetId": target_id, "target": target, "kind": kind,
+        "outcomeLabels": copy.deepcopy(labels), "cutoffAt": payload.get("cutoffAt", now),
+        "horizon": payload["horizon"], "resolutionCriteria": payload["resolutionCriteria"],
+        "probabilities": copy.deepcopy(probabilities), "probabilitySource": source,
+        "empiricalSourceRefs": copy.deepcopy(payload.get("empiricalSourceRefs", [])),
+        "elicitationNotes": payload.get("elicitationNotes"),
+        "evidenceCutoffAt": payload.get("evidenceCutoffAt", now),
+        "retrospectiveImport": payload.get("retrospectiveImport") is True,
+        "snapshot": snapshot, "committedAt": now,
+        "supersedesForecastId": payload.get("supersedesForecastId"),
+    }
+    record["stableHash"] = _stable_hash(record)
+    store.setdefault("forecasts", []).append(record)
+    return copy.deepcopy(record)
+
+
+def brier_binary(probability, outcome):
+    if not _is_finite_number(probability) or probability < 0 or probability > 1:
+        raise ValueError("binary Brier probability must be finite and in [0,1]")
+    if outcome not in (0, 1) or isinstance(outcome, bool):
+        raise ValueError("binary Brier outcome must be numeric 0 or 1")
+    return (probability - outcome) ** 2
+
+
+def brier_categorical(probabilities, labels, outcome):
+    _validate_probability_vector(labels, probabilities)
+    if outcome not in labels:
+        raise ValueError("categorical Brier outcome must be an outcome label")
+    return sum((probabilities[label] - (1 if label == outcome else 0)) ** 2 for label in labels)
+
+
+def resolve_target(store, target_id, outcome, observed_at, evidence_refs, rationale, now=None):
+    forecasts = [f for f in store.get("forecasts", []) if f["targetId"] == target_id]
+    if not forecasts:
+        raise ValueError(f"target-resolve: unknown target id {target_id}")
+    if any(r.get("targetId") == target_id and r.get("status") == "resolved" for r in store.get("targetResolutions", [])):
+        raise ValueError(f"target-resolve: target {target_id} is already resolved")
+    if outcome is not None and (not isinstance(observed_at, int) or isinstance(observed_at, bool)):
+        raise ValueError("target-resolve: observedAt integer timestamp is required for a known outcome")
+    if not isinstance(rationale, str) or not rationale.strip():
+        raise ValueError("target-resolve: verificationRationale is required")
+    if not isinstance(evidence_refs, list) or any(not isinstance(x, str) for x in evidence_refs):
+        raise ValueError("target-resolve: evidenceRefs must be an array of strings")
+    labels = forecasts[0]["outcomeLabels"]
+    status = "unresolved" if outcome is None else "resolved"
+    if outcome is not None and outcome not in labels:
+        raise ValueError(f"target-resolve: outcome must be one of {labels}")
+    record = {
+        "targetId": target_id, "status": status, "outcome": outcome,
+        "observedAt": observed_at, "recordedAt": now,
+        "evidenceRefs": copy.deepcopy(evidence_refs or []), "verificationRationale": rationale,
+    }
+    store.setdefault("targetResolutions", []).append(record)
+    return copy.deepcopy(record)
+
+
+def forecast_summary(store):
+    forecasts = store.get("forecasts", [])
+    resolutions = {r["targetId"]: r for r in store.get("targetResolutions", []) if r.get("status") == "resolved"}
+    scored = []
+    unresolved = set()
+    excluded = []
+    for forecast in forecasts:
+        resolution = resolutions.get(forecast["targetId"] )
+        if not resolution:
+            unresolved.add(forecast["targetId"] )
+            continue
+        eligible = (not forecast.get("retrospectiveImport") and
+                    forecast.get("committedAt") is not None and resolution.get("observedAt") is not None and
+                    forecast["committedAt"] <= resolution["observedAt"] and
+                    forecast.get("evidenceCutoffAt") is not None and forecast["evidenceCutoffAt"] <= resolution["observedAt"] )
+        if not eligible:
+            excluded.append({"forecastId": forecast["id"], "reason": "retrospectiveOrLeaked"})
+            continue
+        outcome = resolution["outcome"]
+        if forecast["kind"] == "binary":
+            event_label = forecast["outcomeLabels"][0]
+            loss = brier_binary(forecast["probabilities"][event_label], 1 if outcome == event_label else 0)
+            convention = "binary-brier-range-0-to-1"
+        else:
+            loss = brier_categorical(forecast["probabilities"], forecast["outcomeLabels"], outcome)
+            convention = "multiclass-brier-sum-range-0-to-2"
+        predicted = max(forecast["probabilities"], key=forecast["probabilities"].get)
+        scored.append({"forecastId": forecast["id"], "targetId": forecast["targetId"],
+                       "outcome": outcome, "loss": loss, "convention": convention,
+                       "correct": predicted == outcome})
+    bins = []
+    for low, high in ((0, .2), (.2, .4), (.4, .6), (.6, .8), (.8, 1.0000001)):
+        entries = []
+        for forecast in forecasts:
+            resolution = resolutions.get(forecast["targetId"])
+            if not resolution or any(x["forecastId"] == forecast["id"] for x in excluded):
+                continue
+            outcome = resolution["outcome"]
+            for label, probability in forecast["probabilities"].items():
+                if low <= probability < high:
+                    entries.append((probability, 1 if label == outcome else 0))
+        count = len(entries)
+        frequency = sum(y for _, y in entries) / count if count else None
+        standard_error = math.sqrt(frequency * (1 - frequency) / count) if count else None
+        bins.append({"range": f"{low:.1f}-{min(high, 1):.1f}", "count": count,
+                     "meanProbability": sum(p for p, _ in entries) / count if count else None,
+                     "observedFrequency": frequency, "standardError": standard_error})
+    conventions = {}
+    for convention in ("binary-brier-range-0-to-1", "multiclass-brier-sum-range-0-to-2"):
+        members = [x for x in scored if x["convention"] == convention]
+        if members:
+            conventions[convention] = {"count": len(members),
+                                       "meanBrierLoss": sum(x["loss"] for x in members) / len(members)}
+    return {
+        "conventions": conventions,
+        "forecastCount": len(forecasts), "resolvedForecastCount": len(scored),
+        "resolvedTargetCount": len({x["targetId"] for x in scored}),
+        "unresolvedTargetCount": len(unresolved),
+        "accuracy": sum(x["correct"] for x in scored) / len(scored) if scored else None,
+        "meanBrierLoss": next(iter(conventions.values()))["meanBrierLoss"] if len(conventions) == 1 else None,
+        "reliabilityBins": bins, "scores": scored, "excluded": excluded,
+        "retrospective": calibration_summary(store),
     }
 
 
@@ -1317,6 +1638,24 @@ def _build_parser():
     p_rescore.add_argument('situation_id')
     p_rescore.add_argument('--json', default=None, help='Matrix as a JSON string (else read from stdin).')
     p_rescore.add_argument('--trigger', default='manual')
+    p_rescore.add_argument('--allow-incomplete', action='store_true')
+
+    p_challenge = sub.add_parser('challenge', help='Update a challenge with history.')
+    p_challenge.add_argument('situation_id')
+    p_challenge.add_argument('hypothesis_id')
+    p_challenge.add_argument('--json', default=None)
+    p_challenge.add_argument('--supersedes', default=None)
+
+    p_forecast = sub.add_parser('forecast', help='Commit an immutable prospective forecast.')
+    p_forecast.add_argument('situation_id')
+    p_forecast.add_argument('--json', default=None)
+
+    p_target = sub.add_parser('target-resolve', help='Record an independently verified target outcome.')
+    p_target.add_argument('target_id')
+    p_target.add_argument('--json', default=None)
+
+    sub.add_parser('forecast-report', help='Score eligible prospective forecasts.')
+    sub.add_parser('migrate', help='Back up and upgrade a legacy ledger.')
 
     p_get = sub.add_parser('get', help='Get a situation\'s full detail view.')
     p_get.add_argument('situation_id')
@@ -1362,7 +1701,24 @@ def _dispatch(args):
 
     path, now = _resolve_path_and_now(args)
 
-    read_only_commands = {'clusters', 'get', 'list', 'surface', 'calibration', 'residual'}
+    if args.command == "migrate":
+        try:
+            legacy = load_ledger(path)
+            if legacy.get("schemaVersion") == SCHEMA_VERSION:
+                result = {"migrated": False, "schemaVersion": SCHEMA_VERSION, "backupPath": None}
+            else:
+                backup_path = path + ".v1.bak"
+                if os.path.exists(backup_path):
+                    raise LedgerError(f"backup already exists: {backup_path}")
+                shutil.copy2(path, backup_path)
+                save_ledger(path, migrate_store(legacy))
+                result = {"migrated": True, "schemaVersion": SCHEMA_VERSION, "backupPath": backup_path}
+        except (LedgerError, OSError) as e:
+            return _error(str(e))
+        _print_json(result)
+        return 0
+
+    read_only_commands = {'clusters', 'get', 'list', 'surface', 'calibration', 'residual', 'forecast-report'}
     is_read_only = args.command in read_only_commands
 
     try:
@@ -1371,6 +1727,8 @@ def _dispatch(args):
         return _error(str(e))
     if store is None:
         store = new_store(now)
+    if not is_read_only and store.get("schemaVersion") != SCHEMA_VERSION:
+        return _error("legacy ledger is read-only until hunch migrate creates a backup and upgrades it")
 
     try:
         result = _run_command(args, store, now)
@@ -1413,7 +1771,23 @@ def _run_command(args, store, now):
 
     if cmd == 'rescore':
         matrix = _read_payload(args.json)
-        return rescore(store, args.situation_id, matrix, now=now, trigger=args.trigger)
+        return rescore(store, args.situation_id, matrix, now=now, trigger=args.trigger, allow_incomplete=args.allow_incomplete)
+
+    if cmd == 'challenge':
+        return update_challenge(store, args.situation_id, args.hypothesis_id,
+                                _read_payload(args.json), now=now, supersedes=args.supersedes)
+
+    if cmd == 'forecast':
+        return create_forecast(store, args.situation_id, _read_payload(args.json), now=now)
+
+    if cmd == 'target-resolve':
+        payload = _read_payload(args.json)
+        return resolve_target(store, args.target_id, payload.get('outcome'),
+                              payload.get('observedAt'), payload.get('evidenceRefs', []),
+                              payload.get('verificationRationale'), now=now)
+
+    if cmd == 'forecast-report':
+        return forecast_summary(store)
 
     if cmd == 'get':
         view = build_detail_view(store, args.situation_id)
@@ -1487,7 +1861,19 @@ def _cmd_demo(args):
             {'statement': 'Mrs. Peacock did it in the kitchen with the lead pipe',
              'prior': 0.5, 'predictedEvidence': ['Peacock seen near kitchen', 'lead pipe missing']},
         ]
-        apply_hypotheses(store, sit['id'], hyps, now=tick())
+        for i, hypothesis in enumerate(hyps):
+            hypothesis["challenge"] = {
+                "status": "unobserved", "counterargument": "Another suspect could fit the same clues",
+                "observationIds": [], "weakeningPrediction": "A controlled alibi check contradicts this account",
+                "test": "Verify the suspect, room, and weapon independently",
+            }
+            if i == 0:
+                hypothesis["candidateSetChallenge"] = {
+                    "status": "unobserved", "counterargument": "The culprit may not be among the named suspects",
+                    "observationIds": [], "weakeningPrediction": "Independent evidence identifies another culprit",
+                    "test": "Check the complete guest and access records",
+                }
+        apply_hypotheses(store, sit["id"], hyps, now=tick())
         steps.append({'step': 'hypotheses', 'count': len(hyps)})
 
         s = get_situation(store, sit['id'])

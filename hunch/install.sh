@@ -127,7 +127,7 @@ looks_like_hunch_install() {
 # Everything a stock --copy install puts at TARGET. Anything else found
 # there (most importantly a .hunch/ ledger a real session created) means
 # this is no longer "just a checkout" and must not be rm -rf'd on a whim.
-KNOWN_MANIFEST="hunch.py test_hunch.py SKILL.md README.md LICENSE install.sh references .gitignore __pycache__ cover.jpeg"
+KNOWN_MANIFEST="hunch.py test_hunch.py SKILL.md README.md LICENSE install.sh EVALUATION.md references .gitignore __pycache__ cover.jpeg"
 
 find_unexpected_entries() {
     dir="$1"
@@ -187,7 +187,7 @@ if [ "$TARGET_SELF" -ne 1 ]; then
     if [ "$MODE" = "copy" ]; then
         rm -rf "$TARGET"
         cp -r "$SCRIPT_DIR" "$TARGET"
-        rm -rf "$TARGET/__pycache__"
+        rm -rf "$TARGET/__pycache__" "$TARGET/.pytest_cache"
         echo "hunch: copied $SCRIPT_DIR -> $TARGET"
     else
         ln -s "$SCRIPT_DIR" "$TARGET"
