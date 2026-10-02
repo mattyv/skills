@@ -44,6 +44,24 @@ are atomic (no corruption from a mid-write crash), but concurrent
 invocations are last-writer-wins — the second write can silently clobber the
 first's, not merge with it.
 
+## Optional TypeSafe assistance
+
+When the `typesafe-ai` skill is available, load it and use Jev for a bounded
+second forecast or evidence check during Hunch work, unless the user requests
+offline-only work or opts out. Follow that skill's live API guidance. Available
+means a callable client/API, configured credentials, and permitted network/data
+access; installing the skill alone does not establish service access. Check
+credential presence without printing secrets. If access is missing, a request
+fails, or the response is invalid, continue the normal Hunch protocol and briefly
+label the fallback. Do not install dependencies or start a setup interview merely
+to enable this optional path.
+
+The agent calls TypeSafe outside `hunch.py`; the ledger engine remains local,
+dependency-free, and network-free. Send only relevant evidence within the user's
+authorized scope. Read [TypeSafe workflow](references/typesafe.md) when using this
+option. Hypothesis creation, challenges, matrix validation, and independent outcome
+verification still apply.
+
 ## The protocol
 
 1. **Open** a situation for the question: `python3 hunch.py open --question "..."`.
