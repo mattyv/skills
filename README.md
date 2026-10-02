@@ -8,6 +8,7 @@ depends on its siblings in this repo.
 
 | Skill | What it does |
 |---|---|
+| [asd-ste100](https://github.com/mattyv/asd-ste100-skill) | Simplified Technical English for clear, unambiguous instructions and technical writing. Maintained in its own repository. |
 | [hunch](hunch/README.md) | Bayesian hypothesis tracking for explanation questions — Claude proposes and scores explanations, a zero-dependency script owns the honest math and a JSON ledger, so beliefs update instead of resetting every conversation. |
 | [learn-by-doing](learn-by-doing/README.md) | Hands-on coding for when you want the ability, not just the artefact — Claude runs one small experiment at a time, asks you to predict before it reveals, and you write the central logic yourself. |
 | [scrutiny](scrutiny/README.md) | Code review as the top comment in a hostile expert thread (r/cpp, r/rust, HN, an OSS PR) — findings sorted into real bugs, fair attacks, unfair attacks with the rebuttal you should have ready, and bikeshedding. |
